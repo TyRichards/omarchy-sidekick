@@ -58,7 +58,7 @@ Web App destinations:
 
 Pi, Oh My Pi, OpenCode, and Crush currently have no Sidekick Web App mapping. Selecting Web for one of them leaves the current activity untouched and shows an inline error.
 
-Desktop mode requires the official `chatgpt` Linux app and a Codex or ChatGPT default. Sidekick launches it with a dedicated app id so the native client uses the same slide-out placement, explicit live-theme Hyprland active/inactive borders, geometry lock, and collapse behavior.
+Desktop mode requires the official `chatgpt` Linux app and a Codex or ChatGPT default. A temporary map-time rule makes the native client transparent, nonanimated, hidden, and fully sized before its first frame; the rule is removed before the normal Sidekick reveal. This prevents default-position flashes and final minimum-size corrections.
 
 Grok Build exposes named built-in themes through `[ui] theme` and `GROK_THEME`, but its current documented settings do not expose an ANSI/default-terminal palette theme. Sidekick therefore leaves the user's Grok theme untouched rather than maintaining a custom approximation.
 

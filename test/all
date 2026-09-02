@@ -190,8 +190,11 @@ rg -Fq 'root.inheritedMotionCurve' Panel.qml
 rg -Fq 'effective.speed || 0) * 100' Panel.qml
 rg -Fq 'MOVE_PROFILE_STATE_FILE' bin/sidekick
 rg -Fq 'set_window_no_animation "$window" 1' bin/sidekick
-rg -Fq 'Web App minimum-size settlement fight the reveal' bin/sidekick
+rg -Fq 'guardian only after the inherited animation has completely' bin/sidekick
 rg -Fq 'window_width_override=480' bin/sidekick
+rg -Fq 'sidekick-desktop-launch-v1' bin/sidekick
+rg -Fq 'opacity = \"0 0\", no_anim = true' bin/sidekick
+rg -Fq 'disable_desktop_launch_rule' bin/sidekick
 rg -Fq 'clientClass.indexOf("brave-") === 0' Panel.qml
 rg -Fq '(1400 / 3)' bin/sidekick
 if rg -Fq '| min | floor) + 100' bin/sidekick; then
@@ -232,8 +235,8 @@ rg -Fq 'dedupe_sidekick_clients' bin/sidekick
 rg -Fq "A tag alone" bin/sidekick
 rg -Fq 'Remove that tag, but never close the window' bin/sidekick
 rg -Fq "Sidekick's silent storage workspace" bin/sidekick
-if rg -Fq 'prop = \"opacity\"' bin/sidekick; then
-  echo "Sidekick visibility must never depend on persistent opacity props" >&2
+if rg -F 'prop = \"opacity\"' bin/sidekick | rg -Fq 'value = \"0\"'; then
+  echo "Hidden Sidekick state must not persist through an opacity=0 property" >&2
   exit 1
 fi
 rg -Fq 'reveal_lua="hl.config({ misc = { animate_manual_resizes = true } })' bin/sidekick

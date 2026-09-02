@@ -111,6 +111,12 @@
 - [x] Fall back to the Omarchy default only when no recoverable Sidekick activity exists.
 - [x] Preserve manual non-default harness activity across normal close, restart, reboot, and recoverable crash state.
 
+## Native Desktop map and settlement
+
+- [x] Apply a temporary map-time rule that makes ChatGPT Desktop transparent, nonanimated, storage-workspace-bound, and 480px wide before its first frame.
+- [x] Remove the temporary rule and restore full opacity only after the native class/window is settled off-screen.
+- [x] Publish guardian visibility after the final reveal target so Desktop cannot bounce through a late correction.
+
 ## Display control order
 
 - [x] Order and title the display controls exactly as Terminal, Web App, Desktop.

@@ -424,6 +424,22 @@ disable_web_rule() {
   hyprctl repl 'if _G.sidekick_web_rule ~= nil then _G.sidekick_web_rule:set_enabled(false) end; if _G.sidekick_web_rule_v2 ~= nil then _G.sidekick_web_rule_v2:set_enabled(false) end' >/dev/null 2>&1 || true
 }
 
+ensure_desktop_launch_rule() {
+  local side
+  side=$(normalize_side "${1:-right}")
+  local x y _width height off_x _workspace_id _strip_width _monitor_name
+  IFS=$'\t' read -r x y _width height off_x _workspace_id _strip_width _monitor_name < <(position_data "$side")
+  local window_width=480
+  [[ $side != left ]] || off_x=$((off_x - window_width + _width))
+  local lua
+  lua="_G.sidekick_desktop_launch_rule = hl.window_rule({ name = \"sidekick-desktop-launch-v1\", match = { class = \"^io\\\\.github\\\\.tyrichards\\\\.sidekick$\" }, workspace = \"$WORKSPACE silent\", float = true, size = { \"$window_width\", \"$height\" }, move = { \"$off_x\", \"$y\" }, opacity = \"0 0\", no_anim = true, tag = \"+sidekick\" }); _G.sidekick_desktop_launch_rule:set_enabled(true)"
+  hyprctl repl "$lua" >/dev/null 2>&1 || true
+}
+
+disable_desktop_launch_rule() {
+  hyprctl repl 'if _G.sidekick_desktop_launch_rule ~= nil then _G.sidekick_desktop_launch_rule:set_enabled(false); _G.sidekick_desktop_launch_rule = nil end' >/dev/null 2>&1 || true
+}
+
 ensure_inner_padding_layer_rule() {
   hyprctl repl 'if _G.sidekick_inner_padding_rule ~= nil then _G.sidekick_inner_padding_rule:set_enabled(false) end; _G.sidekick_inner_padding_rule_v2 = hl.layer_rule({ name = "sidekick-inner-padding-order-v2", match = { namespace = "^sidekick-inner-padding-(left|right)$" }, order = 100, no_anim = true, animation = "none" }); _G.sidekick_inner_padding_rule_v2:set_enabled(true); _G.sidekick_horizontal_padding_rule = hl.layer_rule({ name = "sidekick-horizontal-padding-order", match = { namespace = "^sidekick-horizontal-padding-(left|right)$" }, order = -100, no_anim = true, animation = "none" }); _G.sidekick_horizontal_padding_rule:set_enabled(true)' >/dev/null 2>&1 || true
 }
@@ -563,10 +579,11 @@ reveal_preloaded_window() {
   set_strip_state false "$side" "$strip_width" "$monitor_name" "$address" "$requested_width" "$target_y" "$target_height" true true
   reveal_lua="hl.config({ misc = { animate_manual_resizes = true } }); hl.dispatch(hl.dsp.window.set_prop({ window = \"$window\", prop = \"no_anim\", value = \"1\" })); $workspace_action hl.dispatch(hl.dsp.window.float({ window = \"$window\", action = \"enable\" })); hl.dispatch(hl.dsp.window.pin({ window = \"$window\", action = \"enable\" })); hl.dispatch(hl.dsp.window.alter_zorder({ window = \"$window\", mode = \"top\" })); hl.dispatch(hl.dsp.focus({ workspace = \"$active_workspace\" })); hl.dispatch(hl.dsp.focus({ window = \"$window\" })); hl.dispatch(hl.dsp.window.set_prop({ window = \"$window\", prop = \"no_anim\", value = \"unset\" })); hl.dispatch(hl.dsp.window.move({ window = \"$window\", x = $target_x, y = $target_y }))"
   hyprctl repl "$reveal_lua" >/dev/null
-  # Publish visible state after motion has already been dispatched; file I/O and
-  # layer updates can no longer delay the first rendered frame.
-  set_strip_state true "$side" "$strip_width" "$monitor_name" "$address" "$requested_width" "$target_y" "$target_height"
+  # Keep the geometry guardian disabled for the entire inherited animation.
+  # Publishing earlier let delayed Desktop map events restage the window at the
+  # off-screen coordinate near the final frame.
   finish_window_move "$motion_profile"
+  set_strip_state true "$side" "$strip_width" "$monitor_name" "$address" "$requested_width" "$target_y" "$target_height"
   return 0
 }
 
@@ -657,10 +674,10 @@ place_window() {
   hypr_dispatch \
     "hl.dsp.window.move({ window = \"$window\", x = $x, y = $y })" \
     movewindowpixel "exact $x $y,$window"
-  # Start the guardian only after the final X target exists; publishing during
-  # off-screen staging made Web App minimum-size settlement fight the reveal.
-  set_strip_state true "$side" "$strip_width" "$monitor_name" "$address" "$pane_width" "$y" "$height"
+  # Start the guardian only after the inherited animation has completely
+  # settled; Web/Desktop map events cannot fight the final frame.
   finish_window_move "$motion_profile"
+  set_strip_state true "$side" "$strip_width" "$monitor_name" "$address" "$pane_width" "$y" "$height"
   # Keep manual move animations enabled while Sidekick is visible so bar-bound
   # geometry changes can begin synchronously from Quickshell.
 }
@@ -792,9 +809,9 @@ launch_agent() {
       notify "Desktop App unavailable" "Install ChatGPT Desktop and select Codex or ChatGPT as the default agent."
       return 1
     fi
-    # The official Electron client honors Chromium's --class switch. Giving
-    # its dedicated Sidekick window our stable app id lets it share all panel
-    # placement, geometry-lock, persistence, and collapse behavior.
+    # Hide and fully size the native window at map time. Electron otherwise
+    # paints one default-position frame before its class/size settles.
+    ensure_desktop_launch_rule "$side"
     chatgpt --class="$APP_ID" 9>&- >/dev/null 2>&1 &
   elif [[ $display == web ]]; then
     local url
@@ -837,6 +854,11 @@ launch_agent() {
       # map-time rules and client constraints have settled.
       sleep 0.20
       address=$(jq -r '.address' <<<"$json")
+      if [[ $display == desktop && $empty_terminal != true ]]; then
+        disable_desktop_launch_rule
+        hyprctl dispatch "hl.dsp.window.set_prop({ window = \"address:$address\", prop = \"opacity\", value = \"1\" })" >/dev/null 2>&1 || true
+        set_window_no_animation "address:$address" unset
+      fi
       if [[ $display == web && $empty_terminal != true ]]; then
         hypr_dispatch \
           "hl.dsp.window.tag({ window = \"address:$address\", tag = \"+sidekick\" })" \
@@ -854,6 +876,7 @@ launch_agent() {
   done
 
   [[ $display != web || $empty_terminal == true ]] || disable_web_rule
+  [[ $display != desktop || $empty_terminal == true ]] || disable_desktop_launch_rule
   set_strip_state false "$side" 0 ""
   notify "Sidekick did not appear" "The $(agent_name "$agent") window did not expose the expected app id."
   return 1
