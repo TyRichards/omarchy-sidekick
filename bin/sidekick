@@ -432,12 +432,31 @@ ensure_desktop_launch_rule() {
   local window_width=480
   [[ $side != left ]] || off_x=$((off_x - window_width + _width))
   local lua
-  lua="_G.sidekick_desktop_launch_rule = hl.window_rule({ name = \"sidekick-desktop-launch-v1\", match = { class = \"^io\\\\.github\\\\.tyrichards\\\\.sidekick$\" }, workspace = \"$WORKSPACE silent\", float = true, size = { \"$window_width\", \"$height\" }, move = { \"$off_x\", \"$y\" }, opacity = \"0 0\", no_anim = true, tag = \"+sidekick\" }); _G.sidekick_desktop_launch_rule:set_enabled(true)"
+  lua="if _G.sidekick_window_rule ~= nil then _G.sidekick_window_rule:set_enabled(false) end; if _G.sidekick_lock_rule_v8 ~= nil then _G.sidekick_lock_rule_v8:set_enabled(false) end; _G.sidekick_desktop_launch_rule = hl.window_rule({ name = \"sidekick-desktop-launch-v1\", match = { class = \"^io\\\\.github\\\\.tyrichards\\\\.sidekick$\" }, workspace = \"$WORKSPACE silent\", float = true, size = { \"$window_width\", \"$height\" }, move = { \"$off_x\", \"$y\" }, opacity = \"0 0\", no_anim = true, tag = \"+sidekick\" }); _G.sidekick_desktop_launch_rule:set_enabled(true)"
   hyprctl repl "$lua" >/dev/null 2>&1 || true
 }
 
 disable_desktop_launch_rule() {
   hyprctl repl 'if _G.sidekick_desktop_launch_rule ~= nil then _G.sidekick_desktop_launch_rule:set_enabled(false); _G.sidekick_desktop_launch_rule = nil end' >/dev/null 2>&1 || true
+}
+
+wait_desktop_client_ready() {
+  local address=$1 previous='' signature='' stable=0 json
+  for _ in $(seq 1 80); do
+    json=$(hyprctl clients -j 2>/dev/null | jq -c --arg address "$address" 'first(.[]|select(.address==$address)) // empty')
+    [[ -n $json ]] || { sleep 0.03; continue; }
+    signature=$(jq -r '[.title, .size[0], .size[1]] | @tsv' <<<"$json")
+    if [[ $(jq -r '.title' <<<"$json") == ChatGPT && $(jq -r '.size[0]' <<<"$json") -ge 480 && $signature == "$previous" ]]; then
+      ((stable += 1))
+      (( stable >= 5 )) && break
+    else
+      stable=0
+    fi
+    previous=$signature
+    sleep 0.03
+  done
+  # Give Electron one final compositor frame while still invisible/off-screen.
+  sleep 0.05
 }
 
 ensure_inner_padding_layer_rule() {
@@ -855,7 +874,10 @@ launch_agent() {
       sleep 0.20
       address=$(jq -r '.address' <<<"$json")
       if [[ $display == desktop && $empty_terminal != true ]]; then
+        wait_desktop_client_ready "$address"
         disable_desktop_launch_rule
+        ensure_rule "$side"
+        ensure_lock_rule "$side"
         hyprctl dispatch "hl.dsp.window.set_prop({ window = \"address:$address\", prop = \"opacity\", value = \"1\" })" >/dev/null 2>&1 || true
         set_window_no_animation "address:$address" unset
       fi

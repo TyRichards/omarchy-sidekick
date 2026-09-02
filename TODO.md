@@ -155,7 +155,7 @@
 - [x] Keep the pane fixed at 466px and extend it beneath a same-side vertical bar.
 - [x] Simulate asymmetric side padding with a nonanimated theme-background layer of the bar's exact width just inside the pane border.
 - [x] Use the same nonanimated theme-background masking for top/bottom bars, matching their exact height across the full pane width.
-- [x] Omit the top horizontal padding layer specifically for Web App mode while retaining its bottom-bar behavior.
+- [x] Show exact-height top and bottom horizontal padding layers in Web App mode as well as Terminal/Desktop.
 - [x] Keep dedicated left/right padding layers mapped and input-transparent, toggling only color to avoid reveal-time creation, dynamic anchor flips, and frame hitches.
 - [x] Derive same-side icon-mask width from the exact moving pane/bar intersection so icons disappear under the leading edge and reappear only behind the trailing edge.
 - [x] Hold top/bottom/side padding coverage through collapse, translate it by the full pane width with the exact pane duration/easing, and clear it only after both settle off-screen.

@@ -96,7 +96,6 @@ Panel {
     && String(stripState.monitor || "") === screenName
     && bar && bar.barHidden !== true
     && (bar.position === "top" || bar.position === "bottom")
-    && !(bar.position === "top" && displayPreference === "web")
 
   function loadMotionProfile(raw) {
     var parsed = null
