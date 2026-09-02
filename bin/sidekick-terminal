@@ -1,0 +1,72 @@
+#!/bin/bash
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+"$SCRIPT_DIR/sidekick-activity-watch" "$$" &
+watcher_pid=$!
+cleanup() {
+  kill "$watcher_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  "$SCRIPT_DIR/sidekick" activity-end >/dev/null 2>&1 || true
+  "$SCRIPT_DIR/sidekick" strip-hide "$PPID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+mode=${1:-agent}
+shift || true
+
+run_resumed_agent() {
+  local agent=$1
+  case "$agent" in
+    pi) pi --continue ;;
+    claude) claude --permission-mode bypassPermissions --continue ;;
+    codex) codex --dangerously-bypass-approvals-and-sandbox resume --last ;;
+    grok) grok --permission-mode bypassPermissions --continue ;;
+    opencode) opencode --auto ;;
+    omp) omp --auto-approve ;;
+    gemini) gemini --yolo ;;
+    copilot) copilot --allow-all ;;
+    crush) crush --yolo ;;
+    *) return 127 ;;
+  esac
+}
+
+case "$mode" in
+  agent)
+    # Default fallback only when no persisted Sidekick activity exists.
+    omarchy-agent --inline
+    ;;
+  resume)
+    recovery_agent=${1:-}
+    recovery_cwd=${2:-$HOME/Work}
+    [[ -d $recovery_cwd ]] && cd "$recovery_cwd" || cd "$HOME/Work" || true
+    run_resumed_agent "$recovery_agent" || true
+    ;;
+  shell)
+    recovery_cwd=${1:-$HOME/Work}
+    [[ -d $recovery_cwd ]] && cd "$recovery_cwd" || cd "$HOME/Work" || true
+    ;;
+  unavailable) ;;
+  empty)
+    [[ -d $HOME/Work ]] && cd "$HOME/Work" || true
+    ;;
+  *) mode=empty ;;
+esac
+
+shell=${SHELL:-}
+if [[ -z $shell || ! -x $shell ]]; then
+  shell=$(getent passwd "$(id -u)" | cut -d: -f7)
+fi
+[[ -n $shell && -x $shell ]] || shell=/bin/bash
+
+# TUI agents commonly use the alternate screen. Restore cooked terminal state
+# and discard pending input before starting the shell. The flush matters for
+# Pi's native Ctrl+D: its EOT must not leak into the replacement login shell.
+stty sane 2>/dev/null || true
+python3 -c 'import sys, termios; termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)' 2>/dev/null || true
+printf '\033[2J\033[3J\033[H'
+
+if [[ $mode == unavailable ]]; then
+  printf '%s\n\n' "There is no native Omarchy TUI option for that agent, but that's okay. Just run your terminal command here to boot up any weird terminal agent you've got!"
+fi
+
+"$shell" -l

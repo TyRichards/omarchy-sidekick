@@ -1,0 +1,1419 @@
+#!/bin/bash
+set -euo pipefail
+
+APP_ID="io.github.tyrichards.sidekick"
+WORKSPACE="special:sidekick"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PLUGIN_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+DESKTOP_FILE="$HOME/.local/share/applications/$APP_ID.desktop"
+STRIP_STATE_FILE="$HOME/.local/state/omarchy/sidekick-strip.json"
+FOCUS_STATE_FILE="$HOME/.local/state/omarchy/sidekick-focus"
+MANUAL_ANIMATION_STATE_FILE="$HOME/.local/state/omarchy/sidekick-manual-animation"
+MOVE_PROFILE_STATE_FILE="$HOME/.local/state/omarchy/sidekick-move-profile"
+CURSOR_WARP_STATE_FILE="$HOME/.local/state/omarchy/sidekick-cursor-no-warps"
+ACTIVITY_STATE_FILE="$HOME/.local/state/omarchy/sidekick-activity.json"
+
+notify() {
+  notify-send -a Sidekick -i "$PLUGIN_DIR/assets/sidekick.svg" "$@" >/dev/null 2>&1 || true
+}
+
+normalize_side() {
+  [[ ${1:-right} == left ]] && printf 'left\n' || printf 'right\n'
+}
+
+normalize_display() {
+  case ${1:-tui} in
+    web) printf 'web\n' ;;
+    desktop) printf 'desktop\n' ;;
+    *) printf 'tui\n' ;;
+  esac
+}
+
+mark_activity_ended() {
+  [[ -f $ACTIVITY_STATE_FILE ]] || return 0
+  local tmp
+  tmp=$(mktemp "${ACTIVITY_STATE_FILE}.XXXXXX")
+  jq '.active = false' "$ACTIVITY_STATE_FILE" >"$tmp" 2>/dev/null && mv "$tmp" "$ACTIVITY_STATE_FILE" || rm -f "$tmp"
+}
+
+activity_agent() {
+  [[ -f $ACTIVITY_STATE_FILE ]] && jq -r '.agent // empty' "$ACTIVITY_STATE_FILE" 2>/dev/null || true
+}
+
+activity_cwd() {
+  local cwd=""
+  [[ -f $ACTIVITY_STATE_FILE ]] && cwd=$(jq -r '.cwd // empty' "$ACTIVITY_STATE_FILE" 2>/dev/null || true)
+  [[ -d $cwd ]] && printf '%s\n' "$cwd" || printf '%s\n' "$HOME/Work"
+}
+
+remember_focus() {
+  local known_sidekick_address=${1:-}
+  local active sidekick=''
+  active=$(hyprctl activewindow -j 2>/dev/null || true)
+  [[ -n $known_sidekick_address ]] || sidekick=$(client_json || true)
+  local address sidekick_address
+  address=$(jq -r '.address // empty' <<<"$active" 2>/dev/null || true)
+  sidekick_address=$known_sidekick_address
+  [[ -n $sidekick_address ]] || sidekick_address=$(jq -r '.address // empty' <<<"$sidekick" 2>/dev/null || true)
+  [[ -n $address && $address != "0x0" && $address != "$sidekick_address" ]] || return 0
+  mkdir -p "$(dirname "$FOCUS_STATE_FILE")"
+  printf '%s\n' "$address" >"$FOCUS_STATE_FILE"
+}
+
+restore_focus() {
+  [[ -f $FOCUS_STATE_FILE ]] || return 0
+  local address
+  read -r address <"$FOCUS_STATE_FILE"
+  [[ $address =~ ^0x[0-9a-fA-F]+$ ]] || return 0
+  local clients active_workspace target_workspace
+  clients=$(hyprctl clients -j 2>/dev/null || true)
+  target_workspace=$(jq -r --arg address "$address" 'first(.[] | select(.address == $address)) | .workspace.id // empty' <<<"$clients")
+  [[ -n $target_workspace ]] || return 0
+  active_workspace=$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // empty')
+  # A stale focus address from a prior workspace must never make a reveal or
+  # delayed terminal cleanup pull the user back to that old workspace.
+  [[ -n $active_workspace && $target_workspace == "$active_workspace" ]] || return 0
+  hypr_dispatch \
+    "hl.dsp.focus({ window = \"address:$address\" })" \
+    focuswindow "address:$address"
+}
+
+focus_away_from_sidekick() {
+  local direction=${1:-}
+  [[ $direction == left || $direction == right ]] || return 0
+  local side
+  side=$(jq -r '.side // "right"' "$STRIP_STATE_FILE" 2>/dev/null || printf 'right\n')
+  side=$(normalize_side "$side")
+  # Only the inward direction leaves the edge pane.
+  [[ ($side == right && $direction == left) || ($side == left && $direction == right) ]] || return 0
+
+  local address='' clients active_workspace target_workspace
+  [[ -f $FOCUS_STATE_FILE ]] && read -r address <"$FOCUS_STATE_FILE"
+  clients=$(hyprctl clients -j 2>/dev/null || true)
+  active_workspace=$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // empty')
+  target_workspace=$(jq -r --arg address "$address" 'first(.[] | select(.address == $address)) | .workspace.id // empty' <<<"$clients")
+  if [[ $address =~ ^0x[0-9a-fA-F]+$ && -n $active_workspace && $target_workspace == "$active_workspace" ]]; then
+    hypr_dispatch \
+      "hl.dsp.focus({ window = \"address:$address\" })" \
+      focuswindow "address:$address"
+  else
+    local short_direction=${direction:0:1}
+    hypr_dispatch \
+      "hl.dsp.focus({ direction = \"$short_direction\" })" \
+      movefocus "$short_direction"
+  fi
+}
+
+focus_sidekick_at_edge() {
+  local direction=${1:-} previous_address=${2:-}
+  [[ $direction == left || $direction == right ]] || return 0
+  [[ $previous_address =~ ^0x[0-9a-fA-F]+$ ]] || return 0
+
+  local side visible
+  side=$(jq -r '.side // "right"' "$STRIP_STATE_FILE" 2>/dev/null || printf 'right\n')
+  visible=$(jq -r '.visible // false' "$STRIP_STATE_FILE" 2>/dev/null || printf 'false\n')
+  side=$(normalize_side "$side")
+  [[ $visible == true && $side == "$direction" ]] || return 0
+
+  local active json active_address active_workspace sidekick_workspace sidekick_address
+  active=$(hyprctl activewindow -j 2>/dev/null || true)
+  active_address=$(jq -r '.address // empty' <<<"$active")
+  # Normal directional focus won if the active address changed. Sidekick is
+  # entered only when the request ran past the outermost regular pane.
+  [[ $active_address == "$previous_address" ]] || return 0
+
+  json=$(client_json || true)
+  [[ -n $json ]] || return 0
+  active_workspace=$(jq -r '.workspace.id // empty' <<<"$active")
+  sidekick_workspace=$(jq -r '.workspace.id // empty' <<<"$json")
+  sidekick_address=$(jq -r '.address // empty' <<<"$json")
+  [[ -n $active_workspace && $sidekick_workspace == "$active_workspace" ]] || return 0
+  hypr_dispatch \
+    "hl.dsp.focus({ window = \"address:$sidekick_address\" })" \
+    focuswindow "address:$sidekick_address"
+}
+
+remember_manual_animation_setting() {
+  [[ -f $MANUAL_ANIMATION_STATE_FILE ]] && return 0
+  mkdir -p "$(dirname "$MANUAL_ANIMATION_STATE_FILE")"
+  if manual_move_animations_enabled; then
+    printf 'true\n' >"$MANUAL_ANIMATION_STATE_FILE"
+  else
+    printf 'false\n' >"$MANUAL_ANIMATION_STATE_FILE"
+  fi
+}
+
+restore_manual_animation_setting() {
+  [[ -f $MANUAL_ANIMATION_STATE_FILE ]] || return 0
+  local value
+  read -r value <"$MANUAL_ANIMATION_STATE_FILE"
+  rm -f "$MANUAL_ANIMATION_STATE_FILE"
+  [[ $value == true ]] && set_manual_move_animations true || set_manual_move_animations false
+}
+
+set_cursor_guard() {
+  local action=${1:-off}
+  if [[ $action == on ]]; then
+    if [[ ! -f $CURSOR_WARP_STATE_FILE ]]; then
+      mkdir -p "$(dirname "$CURSOR_WARP_STATE_FILE")"
+      hyprctl getoption cursor:no_warps 2>/dev/null | awk '/^bool:/ { print $2; exit }' >"$CURSOR_WARP_STATE_FILE"
+    fi
+    hyprctl repl '_G.sidekick_modal_open = true; hl.config({ cursor = { no_warps = true } })' >/dev/null 2>&1 || true
+    return
+  fi
+
+  if [[ ! -f $CURSOR_WARP_STATE_FILE ]]; then
+    hyprctl repl '_G.sidekick_modal_open = false' >/dev/null 2>&1 || true
+    return 0
+  fi
+  local previous
+  read -r previous <"$CURSOR_WARP_STATE_FILE"
+  rm -f "$CURSOR_WARP_STATE_FILE"
+  [[ $previous == true ]] && previous=true || previous=false
+  hyprctl repl "_G.sidekick_modal_open = false; hl.config({ cursor = { no_warps = $previous } })" >/dev/null 2>&1 || true
+}
+
+set_strip_state() {
+  local visible=$1
+  local side=${2:-right}
+  local width=${3:-0}
+  local monitor=${4:-}
+  local address=${5:-}
+  local pane_width=${6:-0}
+  local pane_y=${7:-0}
+  local pane_height=${8:-0}
+  local cover_visible=${9:-$visible}
+  local padding_open=${10:-$visible}
+  mkdir -p "$(dirname "$STRIP_STATE_FILE")"
+  local tmp
+  tmp=$(mktemp "${STRIP_STATE_FILE}.XXXXXX")
+  jq -nc --argjson visible "$visible" --arg side "$side" \
+    --argjson width "$width" --arg monitor "$monitor" --arg address "$address" --argjson paneWidth "$pane_width" \
+    --argjson paneY "$pane_y" --argjson paneHeight "$pane_height" --argjson coverVisible "$cover_visible" --argjson paddingOpen "$padding_open" \
+    '{visible:$visible,coverVisible:$coverVisible,paddingOpen:$paddingOpen,side:$side,width:$width,monitor:$monitor,address:$address,paneWidth:$paneWidth,paneY:$paneY,paneHeight:$paneHeight}' >"$tmp"
+  mv "$tmp" "$STRIP_STATE_FILE"
+}
+
+web_url() {
+  case "${1:-}" in
+    chatgpt) printf '%s\n' "https://chatgpt.com" ;;
+    claude) printf '%s\n' "https://claude.ai/new" ;;
+    codex) printf '%s\n' "https://chatgpt.com" ;;
+    copilot) printf '%s\n' "https://github.com/copilot" ;;
+    gemini) printf '%s\n' "https://gemini.google.com/app" ;;
+    grok) printf '%s\n' "https://grok.com" ;;
+    *) return 1 ;;
+  esac
+}
+
+tui_supported_agent() {
+  case "${1:-}" in
+    pi | omp | opencode | claude | codex | grok | gemini | copilot | crush) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+agent_name() {
+  case "${1:-}" in
+    chatgpt) printf 'ChatGPT' ;;
+    claude) printf 'Claude' ;;
+    codex) printf 'Codex' ;;
+    copilot) printf 'GitHub Copilot' ;;
+    crush) printf 'Crush' ;;
+    gemini) printf 'Gemini' ;;
+    grok) printf 'Grok' ;;
+    omp | oh-my-pi) printf 'Oh My Pi' ;;
+    opencode | open-code) printf 'OpenCode' ;;
+    pi) printf 'Pi' ;;
+    *) printf '%s' "${1:-Agent}" ;;
+  esac
+}
+
+client_json() {
+  local state_address
+  state_address=$(jq -r '.address // empty' "$STRIP_STATE_FILE" 2>/dev/null || true)
+  hyprctl clients -j 2>/dev/null | jq -c --arg app "$APP_ID" --arg address "$state_address" '
+    (first(.[] | select(.address == $address)) //
+     first(.[] | select(.class == $app or .initialClass == $app))) // empty
+  '
+}
+
+dedupe_sidekick_clients() {
+  local all clients state_address keep_address stale
+  state_address=$(jq -r '.address // empty' "$STRIP_STATE_FILE" 2>/dev/null || true)
+  all=$(hyprctl clients -j 2>/dev/null || printf '[]')
+  # Ownership is exact app-id or the address persisted by Sidekick. A tag alone
+  # is never sufficient reason to close someone else's window.
+  clients=$(jq -c --arg app "$APP_ID" --arg address "$state_address" '[.[] | select(
+    .address == $address or .class == $app or .initialClass == $app
+  )]' <<<"$all")
+  if (( $(jq 'length' <<<"$clients") > 1 )); then
+    keep_address=$(jq -r --arg address "$state_address" '
+      (first(.[] | select(.address == $address)) // .[0]).address
+    ' <<<"$clients")
+    while IFS=$'\t' read -r address pid title; do
+      [[ $address == "$keep_address" ]] && continue
+      hypr_dispatch \
+        "hl.dsp.window.close({ window = \"address:$address\" })" \
+        closewindow "address:$address"
+      [[ $title != ChatGPT || ! $pid =~ ^[0-9]+$ ]] || kill "$pid" >/dev/null 2>&1 || true
+    done < <(jq -r '.[] | [.address, .pid, .title] | @tsv' <<<"$clients")
+    notify "Removed duplicate Sidekick" "Kept the persisted panel and closed only an exact duplicate."
+  fi
+
+  # Old web matching rules could leave a sidekick tag on an unrelated browser
+  # window. Remove that tag, but never close the window.
+  stale=$(jq -r --arg app "$APP_ID" --arg address "$state_address" '.[] | select(
+    .address != $address and .class != $app and .initialClass != $app and
+    any((.tags // [])[]; sub("\\*$"; "") == "sidekick")
+  ) | .address' <<<"$all")
+  while read -r address; do
+    [[ -n $address ]] || continue
+    hypr_dispatch \
+      "hl.dsp.window.tag({ window = \"address:$address\", tag = \"-sidekick\" })" \
+      tagwindow -sidekick "address:$address"
+  done <<<"$stale"
+}
+
+new_web_client() {
+  local before=$1
+  local host=$2
+  hyprctl clients -j 2>/dev/null | jq -c --argjson before "$before" --arg host "$host" '
+    first(.[] | . as $client |
+      select(($before | index($client.address)) == null) |
+      select(([.class, .initialClass, .title, .initialTitle] | join(" ")) | contains($host))
+    ) // empty
+  '
+}
+
+client_hidden() {
+  local json=$1 address
+  jq -e --arg ws "$WORKSPACE" '.workspace.name == $ws' >/dev/null <<<"$json" && return 0
+  address=$(jq -r '.address // empty' <<<"$json")
+  [[ -f $STRIP_STATE_FILE ]] && jq -e --arg address "$address" \
+    '(.visible != true) and (.address == $address)' "$STRIP_STATE_FILE" >/dev/null 2>&1
+}
+
+stored_pane_width() {
+  [[ -f $STRIP_STATE_FILE ]] && jq -r '.paneWidth // empty' "$STRIP_STATE_FILE" 2>/dev/null || true
+}
+
+hypr_dispatch() {
+  local lua=$1
+  shift
+  hyprctl dispatch "$lua" >/dev/null 2>&1 || hyprctl dispatch "$@" >/dev/null 2>&1
+}
+
+manual_move_animations_enabled() {
+  [[ $(hyprctl getoption misc:animate_manual_resizes 2>/dev/null | awk '/^bool:/ { print $2; exit }') == true ]]
+}
+
+set_manual_move_animations() {
+  local value=$1
+  hyprctl repl "hl.config({ misc = { animate_manual_resizes = $value } })" >/dev/null 2>&1 || true
+}
+
+set_window_no_animation() {
+  local window=$1
+  local value=$2
+  hyprctl dispatch "hl.dsp.window.set_prop({ window = \"$window\", prop = \"no_anim\", value = \"$value\" })" >/dev/null 2>&1 || true
+}
+
+theme_border_expression() {
+  local state=$1 variable="${1}_border_color" expression accent
+  expression=$(awk -v variable="$variable" '$1 == "local" && $2 == variable && $3 == "=" { sub(/^[^=]+=[[:space:]]*/, ""); print; exit }' \
+    "$HOME/.local/state/omarchy/current/theme/hyprland.lua" 2>/dev/null || true)
+  if [[ $expression != '"rgb('* && $expression != '"rgba('* && $expression != '"#'* && $expression != \{* ]]; then
+    if [[ $state == active ]]; then
+      accent=$(omarchy-theme-color accent 2>/dev/null | tr -d '#')
+      [[ $accent =~ ^[0-9A-Fa-f]{6}$ ]] || accent="ffffff"
+      expression="\"rgb($accent)\""
+    else
+      expression='"rgba(595959aa)"'
+    fi
+  fi
+  # Hyprland color properties accept rgb()/rgba(), not raw hex literals.
+  [[ $expression != '"#'* ]] || expression="\"rgb(${expression:2:6})\""
+  printf '%s\n' "$expression"
+}
+
+restore_window_theme_border() {
+  local window=$1 border_size active_border inactive_border
+  border_size=$(hyprctl getoption general:border_size 2>/dev/null | awk '/^int:/ { print $2; exit }')
+  [[ $border_size =~ ^[0-9]+$ ]] || border_size=2
+  active_border=$(theme_border_expression active)
+  inactive_border=$(theme_border_expression inactive)
+  hyprctl dispatch "hl.dsp.window.set_prop({ window = \"$window\", prop = \"border_size\", value = \"$border_size\" })" >/dev/null 2>&1 || true
+  hyprctl dispatch "hl.dsp.window.set_prop({ window = \"$window\", prop = \"active_border_color\", value = $active_border })" >/dev/null 2>&1 || true
+  hyprctl dispatch "hl.dsp.window.set_prop({ window = \"$window\", prop = \"inactive_border_color\", value = $inactive_border })" >/dev/null 2>&1 || true
+}
+
+window_move_profile() {
+  hyprctl animations -j 2>/dev/null | jq -r '
+    .[0] as $animations |
+    (first($animations[] | select(.name == "windowsMove"))) as $move |
+    (first($animations[] | select(.name == "windows"))) as $windows |
+    (first($animations[] | select(.name == "global"))) as $global |
+    (if $move.overridden then $move
+     elif $windows.overridden then $windows
+     else $global end) as $effective |
+    [$effective.enabled, $effective.speed, ($effective.bezier // ""), ($effective.style // "")] | @tsv
+  ' 2>/dev/null || printf 'true\t3.79\teaseOutQuint\t\n'
+}
+
+begin_window_move() {
+  # Sidekick never overrides windowsMove. This is the exact effective profile
+  # inherited from windowsMove -> windows -> global in the current theme.
+  cat "$MOVE_PROFILE_STATE_FILE" 2>/dev/null || window_move_profile
+}
+
+finish_window_move() {
+  local profile=$1 enabled speed _curve _style settle
+  IFS=$'\t' read -r enabled speed _curve _style <<<"$profile"
+  if [[ $enabled == true && $speed =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    # Hyprland speed is expressed in deciseconds. Wait for that exact duration
+    # plus roughly one frame before storage/focus cleanup.
+    settle=$(awk -v speed="$speed" 'BEGIN { printf "%.3f", speed / 10 + 0.02 }')
+    sleep "$settle"
+  fi
+}
+
+ensure_rule() {
+  local side
+  side=$(normalize_side "${1:-right}")
+  local _x _y width height _off_x _workspace_id _strip_width _monitor_name
+  IFS=$'\t' read -r _x _y width height _off_x _workspace_id _strip_width _monitor_name < <(position_data "$side")
+
+  local move_x
+  if [[ $side == left ]]; then
+    move_x="(-$width-2)"
+  else
+    move_x='(monitor_w+2)'
+  fi
+
+  # New clients start hidden on the storage workspace. Their visible entrance
+  # is performed later as a pure X-axis windowsMove animation, using the live
+  # Omarchy theme curve and duration.
+  local lua
+  lua="_G.sidekick_legacy_rule = hl.window_rule({ name = \"sidekick-window\", match = { class = \"^io\\\\.github\\\\.tyrichards\\\\.sidekick$\" } }); _G.sidekick_legacy_rule:set_enabled(false); _G.sidekick_window_rule = hl.window_rule({ name = \"sidekick-window-motion-v2\", match = { class = \"^io\\\\.github\\\\.tyrichards\\\\.sidekick$\" }, workspace = \"$WORKSPACE silent\", float = true, size = { \"$width\", \"$height\" }, move = { \"$move_x\", \"0\" }, tag = \"+sidekick\" }); _G.sidekick_window_rule:set_enabled(true); _G.sidekick_terminal_tag_rule = hl.window_rule({ name = \"sidekick-terminal-clipboard-v1\", match = { class = \"^io\\\\.github\\\\.tyrichards\\\\.sidekick$\" }, tag = \"+terminal\" }); _G.sidekick_terminal_tag_rule:set_enabled(true)"
+  hyprctl repl "$lua" >/dev/null 2>&1 || true
+}
+
+ensure_web_rule() {
+  local side
+  side=$(normalize_side "${1:-right}")
+  local host=$2
+  [[ $host =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+
+  local _x _y width height _off_x _workspace_id _strip_width _monitor_name
+  IFS=$'\t' read -r _x _y width height _off_x _workspace_id _strip_width _monitor_name < <(position_data "$side")
+  local move_x
+  if [[ $side == left ]]; then
+    move_x="(-$width-2)"
+  else
+    move_x='(monitor_w+2)'
+  fi
+
+  local host_regex=${host//./\\\\.}
+  local lua
+  lua="if _G.sidekick_web_rule ~= nil then _G.sidekick_web_rule:set_enabled(false) end; _G.sidekick_web_rule_v2 = hl.window_rule({ name = \"sidekick-web-window-v2\", match = { initial_title = \"^$host_regex.*\" }, workspace = \"$WORKSPACE silent\", float = true, size = { \"$width\", \"$height\" }, move = { \"$move_x\", \"0\" } }); _G.sidekick_web_rule_v2:set_enabled(true)"
+  hyprctl repl "$lua" >/dev/null 2>&1 || true
+}
+
+disable_web_rule() {
+  hyprctl repl 'if _G.sidekick_web_rule ~= nil then _G.sidekick_web_rule:set_enabled(false) end; if _G.sidekick_web_rule_v2 ~= nil then _G.sidekick_web_rule_v2:set_enabled(false) end' >/dev/null 2>&1 || true
+}
+
+ensure_inner_padding_layer_rule() {
+  hyprctl repl 'if _G.sidekick_inner_padding_rule ~= nil then _G.sidekick_inner_padding_rule:set_enabled(false) end; _G.sidekick_inner_padding_rule_v2 = hl.layer_rule({ name = "sidekick-inner-padding-order-v2", match = { namespace = "^sidekick-inner-padding-(left|right)$" }, order = 100, no_anim = true, animation = "none" }); _G.sidekick_inner_padding_rule_v2:set_enabled(true); _G.sidekick_horizontal_padding_rule = hl.layer_rule({ name = "sidekick-horizontal-padding-order", match = { namespace = "^sidekick-horizontal-padding-(left|right)$" }, order = -100, no_anim = true, animation = "none" }); _G.sidekick_horizontal_padding_rule:set_enabled(true)' >/dev/null 2>&1 || true
+}
+
+ensure_lock_rule() {
+  local side
+  side=$(normalize_side "${1:-right}")
+  local _x _y width height _off_x _workspace_id _strip_width _monitor_name
+  IFS=$'\t' read -r _x _y width height _off_x _workspace_id _strip_width _monitor_name < <(position_data "$side")
+  local border_size
+  border_size=$(hyprctl getoption general:border_size 2>/dev/null | awk '/^int:/ { print $2; exit }')
+  [[ $border_size =~ ^[0-9]+$ ]] || border_size=2
+
+  local lua
+  lua="if _G.sidekick_lock_rule ~= nil then _G.sidekick_lock_rule:set_enabled(false) end; if _G.sidekick_lock_rule_v2 ~= nil then _G.sidekick_lock_rule_v2:set_enabled(false) end; if _G.sidekick_lock_rule_v3 ~= nil then _G.sidekick_lock_rule_v3:set_enabled(false) end; if _G.sidekick_lock_rule_v4 ~= nil then _G.sidekick_lock_rule_v4:set_enabled(false) end; if _G.sidekick_lock_rule_v5 ~= nil then _G.sidekick_lock_rule_v5:set_enabled(false) end; if _G.sidekick_lock_rule_v6 ~= nil then _G.sidekick_lock_rule_v6:set_enabled(false) end; if _G.sidekick_lock_rule_v7 ~= nil then _G.sidekick_lock_rule_v7:set_enabled(false) end; _G.sidekick_lock_rule_v8 = hl.window_rule({ name = \"sidekick-lock-v8\", match = { tag = \"sidekick\" }, min_size = { $width, $height }, max_size = { $width, $height }, border_size = $border_size, opacity = \"1 1\", suppress_event = \"fullscreen maximize fullscreenoutput\" }); _G.sidekick_lock_rule_v8:set_enabled(true); if _G.sidekick_fullscreen_guard ~= nil then _G.sidekick_fullscreen_guard:remove() end; _G.sidekick_fullscreen_guard = hl.on(\"window.fullscreen\", function(window) if window ~= nil and window.fullscreen ~= 0 then local tags = window.tags or {}; local matched = window.class == \"$APP_ID\"; if type(tags) == \"table\" then for _, tag in pairs(tags) do if tostring(tag):gsub(\"%*$\", \"\") == \"sidekick\" then matched = true end end end; if matched then hl.dispatch(hl.dsp.window.fullscreen_state({ window = window, internal = 0, client = 0 })) end end end)"
+  hyprctl repl "$lua" >/dev/null 2>&1 || true
+}
+
+clear_legacy_opacity_rule() {
+  # Builds before 0.1.0 briefly forced Sidekick opaque. Disable that runtime
+  # rule during upgrade so the normal global window/terminal transparency wins.
+  hyprctl repl 'if _G.sidekick_opacity_rule ~= nil then _G.sidekick_opacity_rule:set_enabled(false); _G.sidekick_opacity_rule = nil end' >/dev/null 2>&1 || true
+}
+
+bar_position() {
+  local user_config="$HOME/.config/omarchy/shell.json"
+  local default_config="/usr/share/omarchy/config/omarchy/shell.json"
+  jq -r '.bar.position // "top"' "$user_config" 2>/dev/null \
+    || jq -r '.bar.position // "top"' "$default_config" 2>/dev/null \
+    || printf 'top\n'
+}
+
+position_data() {
+  local side
+  side=$(normalize_side "${1:-right}")
+  local bar_state=${2:-auto}
+  local bar_pos
+  bar_pos=$(bar_position)
+  local monitors layers active_window
+  monitors=$(hyprctl monitors -j)
+  layers=$(hyprctl layers -j)
+  active_window=$(hyprctl activewindow -j 2>/dev/null || printf '{}')
+
+  jq -nr --arg side "$side" --arg barPos "$bar_pos" --arg barState "$bar_state" \
+    --argjson monitors "$monitors" --argjson layers "$layers" --argjson activeWindow "$active_window" '
+    (first($monitors[] | select(.id == ($activeWindow.monitor // -1))) //
+     first($monitors[] | select(.focused == true)) // $monitors[0]) as $m |
+    ($m.width / ($m.scale // 1)) as $mw |
+    ($m.height / ($m.scale // 1)) as $mh |
+    ([($mw / 3), (1400 / 3)] | min | floor) as $w |
+    ([ $layers[$m.name].levels | to_entries[].value[] |
+       select(.namespace == "omarchy-bar") ][0] //
+      {x: ($m.x // 0), y: ($m.y // 0), w: 0, h: 0}) as $bar |
+    (($m.x // 0)) as $mx |
+    (($m.y // 0)) as $my |
+    (if $barState == "hidden" then false
+     elif $barState == "shown" then true
+     else ($bar.x < ($mx + $mw) and ($bar.x + $bar.w) > $mx
+       and $bar.y < ($my + $mh) and ($bar.y + $bar.h) > $my) end) as $barShown |
+    (if ($barShown and ($barPos == "left" or $barPos == "right"))
+     then $bar.w else 0 end) as $barWidth |
+    (if (($barPos == "left" or $barPos == "right") and $barPos == $side)
+     then $barWidth else 0 end) as $stripWidth |
+    $w as $windowWidth |
+    ($my - 4) as $y |
+    ($my + $mh + 4) as $bottom |
+    ($bottom - $y) as $h |
+    $mx as $left |
+    ($mx + $mw - $windowWidth) as $right |
+    (if $side == "left" then ($mx - $windowWidth - 2)
+     else ($mx + $mw + 2) end) as $offx |
+    (([if $side == "left" then $left else $right end,
+       $y, $windowWidth, $h, $offx,
+       (if (($activeWindow.workspace.id // 0) > 0) then $activeWindow.workspace.id
+        else ($m.activeWorkspace.id // 1) end), $stripWidth] |
+      map(floor) | @tsv) + "\t" + $m.name)
+  '
+}
+
+reveal_preloaded_window() {
+  local address=$1 side=$2 requested_width=$3 known_json=${4:-} known_active=${5:-}
+  [[ -f $STRIP_STATE_FILE ]] || return 1
+
+  local state_visible state_address state_side state_width strip_width _stored_monitor state_y state_height
+  IFS=$'\t' read -r state_visible state_address state_side state_width strip_width _stored_monitor state_y state_height < <(
+    jq -r '[.visible, (.address // ""), (.side // "right"), (.paneWidth // 0), (.width // 0), (.monitor // ""), (.paneY // 0), (.paneHeight // 0)] | @tsv' "$STRIP_STATE_FILE"
+  )
+  [[ $state_visible != true && $state_address == "$address" && $state_side == "$side" ]] || return 1
+  [[ $requested_width =~ ^[0-9]+$ ]] || requested_width=$state_width
+  [[ $requested_width =~ ^[0-9]+$ ]] && (( requested_width > 0 )) || return 1
+  [[ $strip_width =~ ^[0-9]+$ ]] || strip_width=0
+
+  local json actual_width workspace_name active_json active_address active_workspace active_monitor
+  json=$known_json
+  [[ -n $json ]] || json=$(client_json || true)
+  [[ -n $json ]] || return 1
+  IFS=$'\t' read -r actual_width workspace_name < <(
+    jq -r '[.size[0], .workspace.name] | @tsv' <<<"$json"
+  )
+  active_json=$known_active
+  [[ -n $active_json ]] || active_json=$(hyprctl activewindow -j 2>/dev/null || printf '{}')
+  IFS=$'\t' read -r active_address active_workspace active_monitor < <(
+    jq -r '[.address // "", .workspace.id // 0, .monitor // -1] | @tsv' <<<"$active_json"
+  )
+  [[ $active_workspace =~ ^[0-9]+$ ]] && (( active_workspace > 0 )) || return 1
+  [[ $workspace_name == "$WORKSPACE" || $workspace_name == "$active_workspace" ]] || return 1
+
+  local target_x target_y target_height monitor_name
+  IFS=$'\t' read -r target_x target_y target_height monitor_name < <(
+    hyprctl monitors -j 2>/dev/null | jq -r --arg side "$side" --argjson monitor "$active_monitor" \
+      --argjson requested "$requested_width" --argjson actual "$actual_width" --argjson strip "$strip_width" '
+      (first(.[] | select(.id == $monitor)) // first(.[] | select(.focused == true)) // .[0]) as $m |
+      ($m.width / ($m.scale // 1)) as $mw |
+      ($m.height / ($m.scale // 1)) as $mh |
+      ([($actual - $requested), 0] | max) as $overflow |
+      (if $side == "left" then (($m.x // 0) - $overflow)
+       else (($m.x // 0) + $mw - $requested) end) as $target |
+      (([$target, (($m.y // 0) - 4), ($mh + 8)] | map(floor) | @tsv) + "\t" + $m.name)
+    '
+  )
+
+  if [[ $state_height =~ ^[0-9]+$ ]] && (( state_height > 0 )); then
+    target_y=$state_y
+    target_height=$state_height
+  fi
+
+  if [[ -n $active_address && $active_address != 0x0 && $active_address != "$address" ]]; then
+    mkdir -p "$(dirname "$FOCUS_STATE_FILE")"
+    printf '%s\n' "$active_address" >"$FOCUS_STATE_FILE"
+  fi
+
+  local window="address:$address" workspace_action=''
+  [[ $workspace_name != "$WORKSPACE" ]] || workspace_action="hl.dispatch(hl.dsp.window.move({ window = \"$window\", workspace = \"$active_workspace\", follow = false }));"
+  local motion_profile
+  motion_profile=$(begin_window_move)
+  local reveal_lua
+  set_strip_state false "$side" "$strip_width" "$monitor_name" "$address" "$requested_width" "$target_y" "$target_height" true true
+  reveal_lua="hl.config({ misc = { animate_manual_resizes = true } }); hl.dispatch(hl.dsp.window.set_prop({ window = \"$window\", prop = \"no_anim\", value = \"1\" })); $workspace_action hl.dispatch(hl.dsp.window.float({ window = \"$window\", action = \"enable\" })); hl.dispatch(hl.dsp.window.pin({ window = \"$window\", action = \"enable\" })); hl.dispatch(hl.dsp.window.alter_zorder({ window = \"$window\", mode = \"top\" })); hl.dispatch(hl.dsp.focus({ workspace = \"$active_workspace\" })); hl.dispatch(hl.dsp.focus({ window = \"$window\" })); hl.dispatch(hl.dsp.window.set_prop({ window = \"$window\", prop = \"no_anim\", value = \"unset\" })); hl.dispatch(hl.dsp.window.move({ window = \"$window\", x = $target_x, y = $target_y }))"
+  hyprctl repl "$reveal_lua" >/dev/null
+  # Publish visible state after motion has already been dispatched; file I/O and
+  # layer updates can no longer delay the first rendered frame.
+  set_strip_state true "$side" "$strip_width" "$monitor_name" "$address" "$requested_width" "$target_y" "$target_height"
+  finish_window_move "$motion_profile"
+  return 0
+}
+
+place_window() {
+  local address=$1
+  local side
+  side=$(normalize_side "${2:-right}")
+  local from_hidden=${3:-false}
+  local width_override=${4:-}
+  local known_json=${5:-} known_active=${6:-} window_width_override=${7:-}
+  if [[ $from_hidden == true ]] && reveal_preloaded_window "$address" "$side" "$width_override" "$known_json" "$known_active"; then
+    return 0
+  fi
+  local x y width height off_x workspace_id strip_width monitor_name
+  IFS=$'\t' read -r x y width height off_x workspace_id strip_width monitor_name < <(position_data "$side")
+  [[ $width_override =~ ^[0-9]+$ ]] && width=$width_override
+  local pane_width=$width window_width=$width
+  if [[ $window_width_override =~ ^[0-9]+$ ]] && (( window_width_override > window_width )); then
+    window_width=$window_width_override
+    if [[ $side == left ]]; then
+      x=$((x - window_width + pane_width))
+      off_x=$((off_x - window_width + pane_width))
+    fi
+  fi
+  local window="address:$address"
+  restore_window_theme_border "$window"
+  remember_focus
+  remember_manual_animation_setting
+
+  # Preparation is intentionally non-animated. Workspace transfer and pinning
+  # can adjust both coordinates to respect reserved areas; normalize all of
+  # that while the client is still outside the display.
+  set_manual_move_animations false
+
+  local start_x=$off_x
+  local workspace_action=''
+  if [[ $from_hidden == true ]]; then
+    workspace_action="hl.dispatch(hl.dsp.window.move({ window = \"$window\", workspace = \"$workspace_id\", follow = false }));"
+  else
+    local current
+    current=$(client_json || true)
+    [[ -z $current ]] || start_x=$(jq -r '.at[0]' <<<"$current")
+  fi
+
+  # Drop the previous edge's rendered animation state before staging the new
+  # side. Without no_anim, Hyprland can retain the old real-position spring and
+  # visually enter from the opposite edge even though the target is correct.
+  set_window_no_animation "$window" 1
+
+  # One Lua event applies workspace, float, pin, size, and the off-screen start
+  # coordinate atomically. Hyprland cannot render the intermediate pin-adjusted
+  # position (the old source of the tiny vertical hook).
+  local prepare_lua
+  prepare_lua="$workspace_action hl.dispatch(hl.dsp.window.float({ window = \"$window\", action = \"enable\" })); hl.dispatch(hl.dsp.window.pin({ window = \"$window\", action = \"enable\" })); hl.exec_scheduled_prop_refresh_immediately(); hl.dispatch(hl.dsp.window.float({ window = \"$window\", action = \"enable\" })); hl.dispatch(hl.dsp.window.set_prop({ window = \"$window\", prop = \"min_size\", value = \"$window_width $height\" })); hl.dispatch(hl.dsp.window.set_prop({ window = \"$window\", prop = \"max_size\", value = \"$window_width $height\" })); hl.dispatch(hl.dsp.window.resize({ window = \"$window\", x = $window_width, y = $height })); hl.dispatch(hl.dsp.window.move({ window = \"$window\", x = $start_x, y = $y }))"
+  hyprctl repl "$prepare_lua" >/dev/null
+  sleep 0.035
+  local settled_width=0
+  if (( window_width > pane_width )); then
+    # Chromium publishes its enforced minimum asynchronously. Keep it staged
+    # off-screen until that width settles so no visible frame expands afterward.
+    for _ in $(seq 1 24); do
+      settled_width=$(hyprctl clients -j 2>/dev/null | jq -r --arg address "$address" 'first(.[]|select(.address==$address))|.size[0] // 0')
+      (( settled_width >= window_width )) && break
+      sleep 0.01
+    done
+  fi
+  set_window_no_animation "$window" unset
+
+  hypr_dispatch \
+    "hl.dsp.window.alter_zorder({ window = \"$window\", mode = \"top\" })" \
+    alterzorder top "$window"
+  # Reassert the invocation workspace immediately before focusing the remapped
+  # client. Focusing a still-settling storage-workspace surface can otherwise
+  # follow Hyprland's last-used workspace.
+  hypr_dispatch \
+    "hl.dsp.focus({ workspace = \"$workspace_id\" })" \
+    workspace "$workspace_id"
+  hypr_dispatch \
+    "hl.dsp.focus({ window = \"$window\" })" \
+    focuswindow "$window"
+
+  # This is the only visible motion: windowsMove from the live Hyprland theme.
+  # Both endpoints carry the same Y value, so vertical movement is impossible.
+  set_manual_move_animations true
+  local motion_profile
+  motion_profile=$(begin_window_move)
+  set_strip_state false "$side" "$strip_width" "$monitor_name" "$address" "$pane_width" "$y" "$height" true true
+  hypr_dispatch \
+    "hl.dsp.window.move({ window = \"$window\", x = $x, y = $y })" \
+    movewindowpixel "exact $x $y,$window"
+  # Start the guardian only after the final X target exists; publishing during
+  # off-screen staging made Web App minimum-size settlement fight the reveal.
+  set_strip_state true "$side" "$strip_width" "$monitor_name" "$address" "$pane_width" "$y" "$height"
+  finish_window_move "$motion_profile"
+  # Keep manual move animations enabled while Sidekick is visible so bar-bound
+  # geometry changes can begin synchronously from Quickshell.
+}
+
+hide_window() {
+  local json=$1
+  local side
+  side=$(normalize_side "${2:-right}")
+  local handoff=${3:-false}
+  local address current_x current_y current_width current_height requested_width
+  address=$(jq -r '.address' <<<"$json")
+  current_x=$(jq -r '.at[0]' <<<"$json")
+  current_y=$(jq -r '.at[1]' <<<"$json")
+  current_width=$(jq -r '.size[0]' <<<"$json")
+  current_height=$(jq -r '.size[1]' <<<"$json")
+  requested_width=$current_width
+  (( requested_width > 466 )) && requested_width=466
+  local cached_monitor
+  cached_monitor=$(jq -r '.monitor // empty' "$STRIP_STATE_FILE" 2>/dev/null || true)
+  # Stop the QML geometry guardian before any geometry queries or closing work.
+  set_strip_state false "$side" 0 "$cached_monitor" "$address" "$requested_width" "$current_y" "$current_height" true true
+
+  local _x y _width _height off_x _workspace_id _strip_width _monitor_name
+  IFS=$'\t' read -r _x y _width _height off_x _workspace_id _strip_width _monitor_name < <(position_data "$side")
+  if [[ $side == left ]] && (( current_width > _width )); then
+    off_x=$((off_x - current_width + _width))
+  fi
+  local window="address:$address"
+  remember_focus
+
+  # Snap any stale Y coordinate to the target while animation is disabled,
+  # then animate only X with the exact same curve used by reveal.
+  set_manual_move_animations false
+  hypr_dispatch \
+    "hl.dsp.window.move({ window = \"$window\", x = $current_x, y = $y })" \
+    movewindowpixel "exact $current_x $y,$window"
+  set_manual_move_animations true
+  # Start the attached padding translation immediately before pane motion.
+  set_strip_state false "$side" "$_strip_width" "$_monitor_name" "$address" "$requested_width" "$y" "$_height" true false
+  local motion_profile
+  motion_profile=$(begin_window_move)
+  hypr_dispatch \
+    "hl.dsp.window.move({ window = \"$window\", x = $off_x, y = $y })" \
+    movewindowpixel "exact $off_x $y,$window"
+  finish_window_move "$motion_profile"
+
+  local current
+  current=$(client_json || true)
+  if [[ -z $current ]]; then
+    set_strip_state false "$side" "$_strip_width" "$_monitor_name" "$address" "$requested_width" "$y" "$_height"
+    restore_focus
+    restore_manual_animation_setting
+    return 0
+  fi
+
+  set_manual_move_animations false
+  # Keep the loaded client mapped on Sidekick's silent storage workspace while
+  # hidden. No opacity mutation survives across reveal/collapse boundaries.
+  local store_lua
+  store_lua="hl.dispatch(hl.dsp.window.pin({ window = \"$window\", action = \"disable\" })); hl.exec_scheduled_prop_refresh_immediately(); hl.dispatch(hl.dsp.window.move({ window = \"$window\", workspace = \"$WORKSPACE\", follow = false })); hl.dispatch(hl.dsp.window.move({ window = \"$window\", x = $off_x, y = $y }))"
+  hyprctl repl "$store_lua" >/dev/null
+  set_strip_state false "$side" "$_strip_width" "$_monitor_name" "$address" "$requested_width" "$y" "$_height"
+  if [[ $handoff != true ]]; then
+    restore_focus
+    restore_manual_animation_setting
+  fi
+}
+
+preload_window() {
+  local address=$1
+  local side
+  side=$(normalize_side "${2:-right}")
+  local requested_width=${3:-}
+  local x y width height off_x workspace_id _strip_width monitor_name
+  IFS=$'\t' read -r x y width height off_x workspace_id _strip_width monitor_name < <(position_data "$side")
+  [[ $requested_width =~ ^[0-9]+$ ]] && width=$requested_width
+  local window="address:$address"
+  restore_window_theme_border "$window"
+  remember_manual_animation_setting
+  set_manual_move_animations false
+  set_window_no_animation "$window" 1
+
+  local preload_lua
+  preload_lua="hl.dispatch(hl.dsp.window.move({ window = \"$window\", workspace = \"$WORKSPACE\", follow = false })); hl.dispatch(hl.dsp.window.float({ window = \"$window\", action = \"enable\" })); hl.dispatch(hl.dsp.window.pin({ window = \"$window\", action = \"disable\" })); hl.exec_scheduled_prop_refresh_immediately(); hl.dispatch(hl.dsp.window.set_prop({ window = \"$window\", prop = \"min_size\", value = \"$width $height\" })); hl.dispatch(hl.dsp.window.set_prop({ window = \"$window\", prop = \"max_size\", value = \"$width $height\" })); hl.dispatch(hl.dsp.window.resize({ window = \"$window\", x = $width, y = $height })); hl.dispatch(hl.dsp.window.move({ window = \"$window\", x = $off_x, y = $y }))"
+  hyprctl repl "$preload_lua" >/dev/null
+  sleep 0.04
+
+  # Account for any native client whose enforced minimum is wider than the
+  # requested visible pane.
+  local actual_width corrected_off_x
+  actual_width=$(client_json | jq -r '.size[0] // 0')
+  corrected_off_x=$off_x
+  if [[ $side == left && $actual_width =~ ^[0-9]+$ ]] && (( actual_width > width )); then
+    corrected_off_x=$((off_x - actual_width + width))
+    hypr_dispatch \
+      "hl.dsp.window.move({ window = \"$window\", x = $corrected_off_x, y = $y })" \
+      movewindowpixel "exact $corrected_off_x $y,$window"
+  fi
+
+  set_strip_state false "$side" "$_strip_width" "$monitor_name" "$address" "$width" "$y" "$height"
+  set_window_no_animation "$window" unset
+  restore_manual_animation_setting
+}
+
+launch_agent() {
+  local side
+  side=$(normalize_side "${1:-right}")
+  local display
+  display=$(normalize_display "${2:-tui}")
+  local agent=${3:-}
+  local empty_terminal=${4:-false}
+  local show_panel=${5:-true}
+  [[ -n $agent ]] || agent=$(omarchy-default-agent 2>/dev/null || true)
+
+  if [[ $empty_terminal != true && -z $agent ]]; then
+    omarchy-menu summon setup.default.agent >/dev/null 2>&1 &
+    return 0
+  fi
+
+  ensure_rule "$side"
+  ensure_lock_rule "$side"
+
+  local before='[]' host='' pane_width_override='' window_width_override=''
+  [[ $display == web || $display == desktop ]] && window_width_override=480
+  if [[ $empty_terminal == true ]]; then
+    omarchy-launch-tui "--app-id=$APP_ID" "$SCRIPT_DIR/sidekick-terminal" empty 9>&- >/dev/null 2>&1 &
+  elif [[ $display == desktop ]]; then
+    if [[ $agent != codex && $agent != chatgpt ]] || ! command -v chatgpt >/dev/null 2>&1; then
+      notify "Desktop App unavailable" "Install ChatGPT Desktop and select Codex or ChatGPT as the default agent."
+      return 1
+    fi
+    # The official Electron client honors Chromium's --class switch. Giving
+    # its dedicated Sidekick window our stable app id lets it share all panel
+    # placement, geometry-lock, persistence, and collapse behavior.
+    chatgpt --class="$APP_ID" 9>&- >/dev/null 2>&1 &
+  elif [[ $display == web ]]; then
+    local url
+    if ! url=$(web_url "$agent"); then
+      omarchy-shell io.github.tyrichards.sidekick rejectWebApp 9>&- >/dev/null 2>&1 &
+      return 1
+    fi
+    host=${url#*://}
+    host=${host%%/*}
+    ensure_web_rule "$side" "$host"
+    before=$(hyprctl clients -j 2>/dev/null | jq -c 'map(.address)')
+    # Chromium-based browsers derive their Wayland app id from the URL and
+    # ignore --class when reusing an existing browser process. Capture the new
+    # app window, then give it a stable Sidekick tag for every later toggle.
+    omarchy-launch-webapp "$url" 9>&- >/dev/null 2>&1 &
+  else
+    local recovery_agent recovery_cwd
+    recovery_agent=$(activity_agent)
+    recovery_cwd=$(activity_cwd)
+    if [[ -f $ACTIVITY_STATE_FILE && -z $recovery_agent ]]; then
+      omarchy-launch-tui "--app-id=$APP_ID" "$SCRIPT_DIR/sidekick-terminal" shell "$recovery_cwd" 9>&- >/dev/null 2>&1 &
+    elif [[ -n $recovery_agent ]] && tui_supported_agent "$recovery_agent" && command -v "$recovery_agent" >/dev/null 2>&1; then
+      omarchy-launch-tui "--app-id=$APP_ID" "$SCRIPT_DIR/sidekick-terminal" resume "$recovery_agent" "$recovery_cwd" 9>&- >/dev/null 2>&1 &
+    elif tui_supported_agent "$agent" && command -v "$agent" >/dev/null 2>&1; then
+      omarchy-launch-tui "--app-id=$APP_ID" "$SCRIPT_DIR/sidekick-terminal" agent 9>&- >/dev/null 2>&1 &
+    else
+      omarchy-launch-tui "--app-id=$APP_ID" "$SCRIPT_DIR/sidekick-terminal" unavailable 9>&- >/dev/null 2>&1 &
+    fi
+  fi
+
+  local json address
+  for _ in $(seq 1 100); do
+    if [[ $display == web && $empty_terminal != true ]]; then
+      json=$(new_web_client "$before" "$host" || true)
+    else
+      json=$(client_json || true)
+    fi
+    if [[ -n $json ]]; then
+      # Terminal and Chromium windows expose their identity just before all
+      # map-time rules and client constraints have settled.
+      sleep 0.20
+      address=$(jq -r '.address' <<<"$json")
+      if [[ $display == web && $empty_terminal != true ]]; then
+        hypr_dispatch \
+          "hl.dsp.window.tag({ window = \"address:$address\", tag = \"+sidekick\" })" \
+          tagwindow +sidekick "address:$address"
+        disable_web_rule
+      fi
+      if [[ $show_panel == true ]]; then
+        place_window "$address" "$side" true "$pane_width_override" "" "" "$window_width_override"
+      else
+        preload_window "$address" "$side" "$pane_width_override"
+      fi
+      return 0
+    fi
+    sleep 0.08
+  done
+
+  [[ $display != web || $empty_terminal == true ]] || disable_web_rule
+  set_strip_state false "$side" 0 ""
+  notify "Sidekick did not appear" "The $(agent_name "$agent") window did not expose the expected app id."
+  return 1
+}
+
+close_window() {
+  local json=${1:-}
+  remember_focus
+  set_strip_state false "$(normalize_side right)" 0 ""
+  [[ -n $json ]] || json=$(client_json || true)
+  if [[ -z $json ]]; then
+    restore_focus
+    restore_manual_animation_setting
+    return 0
+  fi
+  local address pid title
+  address=$(jq -r '.address' <<<"$json")
+  pid=$(jq -r '.pid // empty' <<<"$json")
+  title=$(jq -r '.title // empty' <<<"$json")
+  hypr_dispatch \
+    "hl.dsp.window.close({ window = \"address:$address\" })" \
+    closewindow "address:$address"
+  sleep 0.04
+  # Electron keeps the native ChatGPT process alive after its last window
+  # closes. A full Sidekick close should end it; collapse deliberately does not.
+  if [[ $title == ChatGPT && $pid =~ ^[0-9]+$ ]]; then
+    kill "$pid" >/dev/null 2>&1 || true
+  fi
+  restore_focus
+  restore_manual_animation_setting
+}
+
+install_desktop_entry() {
+  mkdir -p "$(dirname "$DESKTOP_FILE")"
+  local tmp
+  tmp=$(mktemp)
+  cat >"$tmp" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Sidekick
+GenericName=AI Agent Side Panel
+Comment=Configure the Sidekick agent panel
+Exec=omarchy-shell $APP_ID openSettings
+Icon=$PLUGIN_DIR/assets/sidekick.svg
+Terminal=false
+StartupNotify=false
+Categories=Utility;
+Keywords=AI;Agent;Assistant;Chat;Sidekick;
+EOF
+  if [[ ! -f $DESKTOP_FILE ]] || ! cmp -s "$tmp" "$DESKTOP_FILE"; then
+    install -m 0644 "$tmp" "$DESKTOP_FILE"
+  fi
+  rm -f "$tmp"
+}
+
+register_binding() {
+  command -v hyprctl >/dev/null || return 0
+
+  local existing
+  existing=$(hyprctl binds -j 2>/dev/null | jq -r '
+    first(.[] | select(.modmask == 64 and ((.key // "") | ascii_upcase) == "BACKSLASH") | (.description // "")) // empty
+  ')
+
+  if [[ -n $existing && $existing != Sidekick ]]; then
+    notify "Shortcut already in use" "SUPER + \\ is assigned to $existing. Sidekick left it unchanged."
+    return 0
+  fi
+
+  local launch_command="$PLUGIN_DIR/bin/sidekick toggle-current"
+  launch_command=${launch_command//\\/\\\\}
+  launch_command=${launch_command//\"/\\\"}
+  hyprctl repl \
+    "hl.unbind(\"SUPER + BACKSLASH\"); hl.bind(\"SUPER + BACKSLASH\", hl.dsp.exec_cmd(\"$launch_command\"), { description = \"Sidekick\" })" \
+    >/dev/null 2>&1 || notify "Could not register shortcut" "Bind Sidekick manually to SUPER + \\."
+}
+
+register_context_bindings() {
+  command -v hyprctl >/dev/null || return 0
+
+  local lua
+  read -r -d '' lua <<'LUA' || true
+local function is_sidekick_window(window)
+  if window == nil then return false end
+  if window.class == "io.github.tyrichards.sidekick"
+      or window.initial_class == "io.github.tyrichards.sidekick" then
+    return true
+  end
+
+  local tags = window.tags
+  if type(tags) == "table" then
+    for _, tag in pairs(tags) do
+      if tostring(tag):gsub("%*$", "") == "sidekick" then return true end
+    end
+  elseif type(tags) == "string" then
+    for tag in tags:gmatch("[^,%s]+") do
+      if tag:gsub("%*$", "") == "sidekick" then return true end
+    end
+  end
+  return false
+end
+
+local function send_shortcut_once(mods, key)
+  hl.dispatch(hl.dsp.send_key_state({ mods = mods, key = key, state = "down" }))
+  hl.timer(function()
+    hl.dispatch(hl.dsp.send_key_state({ mods = mods, key = key, state = "up" }))
+  end, { timeout = 50, type = "oneshot" })
+end
+
+local function clipboard_or_passthrough(sidekick_mods, sidekick_key, normal_mods, normal_key)
+  return function()
+    if is_sidekick_window(hl.get_active_window()) then
+      send_shortcut_once(sidekick_mods, sidekick_key)
+    else
+      send_shortcut_once(normal_mods, normal_key)
+    end
+  end
+end
+
+local function collapse_sidekick_or_close_window()
+  local window = hl.get_active_window()
+  if is_sidekick_window(window) then
+    hl.dispatch(hl.dsp.exec_cmd("omarchy-shell io.github.tyrichards.sidekick collapsePanel"))
+  elseif window ~= nil then
+    hl.dispatch(hl.dsp.window.close({ window = window }))
+  end
+end
+
+local function collapse_sidekick_on_escape()
+  if _G.sidekick_modal_open == true then return end
+  local window = hl.get_active_window()
+  if is_sidekick_window(window) then
+    hl.dispatch(hl.dsp.exec_cmd("omarchy-shell io.github.tyrichards.sidekick collapsePanel"))
+  end
+end
+
+local function resize_unless_sidekick(x, y)
+  return function()
+    local window = hl.get_active_window()
+    if window ~= nil and not is_sidekick_window(window) then
+      hl.dispatch(hl.dsp.window.resize({ window = window, x = x, y = y, relative = true }))
+    end
+  end
+end
+
+local function focus_or_leave_sidekick(direction, short_direction)
+  return function()
+    local window = hl.get_active_window()
+    if is_sidekick_window(window) then
+      hl.dispatch(hl.dsp.exec_cmd(
+        "omarchy-shell io.github.tyrichards.sidekick focusAway " .. direction
+      ))
+    elseif window ~= nil then
+      local previous_address = tostring(window.address or "")
+      hl.dispatch(hl.dsp.focus({ direction = short_direction }))
+      hl.dispatch(hl.dsp.exec_cmd(
+        "omarchy-shell io.github.tyrichards.sidekick focusSidekickAtEdge "
+          .. direction .. " " .. previous_address
+      ))
+    end
+  end
+end
+
+local function swap_or_reposition_sidekick(target_side, direction)
+  return function()
+    local window = hl.get_active_window()
+    if is_sidekick_window(window) then
+      hl.dispatch(hl.dsp.exec_cmd(
+        "omarchy-shell io.github.tyrichards.sidekick setSideFromBinding " .. target_side
+      ))
+    elseif window ~= nil then
+      hl.dispatch(hl.dsp.window.swap({ direction = direction }))
+    end
+  end
+end
+
+local resize_binds = {
+  { "SUPER + code:20", -100, 0, "Expand window left" },
+  { "SUPER + code:21", 100, 0, "Shrink window left" },
+  { "SUPER + SHIFT + code:20", 0, -100, "Shrink window up" },
+  { "SUPER + SHIFT + code:21", 0, 100, "Expand window down" },
+  { "SUPER + ALT + code:20", -25, 0, "Expand window left a little" },
+  { "SUPER + ALT + code:21", 25, 0, "Shrink window left a little" },
+  { "SUPER + SHIFT + ALT + code:20", 0, -25, "Shrink window up a little" },
+  { "SUPER + SHIFT + ALT + code:21", 0, 25, "Expand window down a little" },
+  { "SUPER + CTRL + code:20", -300, 0, "Expand window left a lot" },
+  { "SUPER + CTRL + code:21", 300, 0, "Shrink window left a lot" },
+  { "SUPER + CTRL + SHIFT + code:20", 0, -300, "Shrink window up a lot" },
+  { "SUPER + CTRL + SHIFT + code:21", 0, 300, "Expand window down a lot" },
+}
+for _, bind in ipairs(resize_binds) do
+  hl.unbind(bind[1])
+  hl.bind(bind[1], resize_unless_sidekick(bind[2], bind[3]), { description = bind[4] })
+end
+
+hl.unbind("CTRL + C")
+hl.bind("CTRL + C", clipboard_or_passthrough("CTRL", "Insert", "CTRL", "C"),
+  { description = "Sidekick copy / Ctrl+C" })
+hl.unbind("CTRL + V")
+hl.bind("CTRL + V", clipboard_or_passthrough("SHIFT", "Insert", "CTRL", "V"),
+  { description = "Sidekick paste / Ctrl+V" })
+
+hl.unbind("SUPER + LEFT")
+hl.bind("SUPER + LEFT", focus_or_leave_sidekick("left", "l"),
+  { description = "Focus on left window" })
+hl.unbind("SUPER + RIGHT")
+hl.bind("SUPER + RIGHT", focus_or_leave_sidekick("right", "r"),
+  { description = "Focus on right window" })
+
+hl.unbind("SUPER + SHIFT + LEFT")
+hl.bind("SUPER + SHIFT + LEFT", swap_or_reposition_sidekick("left", "l"),
+  { description = "Swap window to the left" })
+hl.unbind("SUPER + SHIFT + RIGHT")
+hl.bind("SUPER + SHIFT + RIGHT", swap_or_reposition_sidekick("right", "r"),
+  { description = "Swap window to the right" })
+
+hl.unbind("SUPER + W")
+hl.bind("SUPER + W", collapse_sidekick_or_close_window, { description = "Close window" })
+
+if _G.sidekick_escape_bind ~= nil then _G.sidekick_escape_bind:remove() end
+_G.sidekick_escape_bind = hl.bind("ESCAPE", collapse_sidekick_on_escape, { non_consuming = true })
+
+-- Older Sidekick builds installed a compositor-level Ctrl+D override. Remove
+-- it during upgrade; agent quit keys now pass through exactly like a normal
+-- terminal.
+if _G.sidekick_ctrl_d_bind ~= nil then
+  _G.sidekick_ctrl_d_bind:remove()
+  _G.sidekick_ctrl_d_bind = nil
+end
+LUA
+
+  hyprctl repl "$lua" >/dev/null 2>&1 || notify \
+    "Could not register collapse keys" \
+    "Sidekick could not override SUPER + W and Escape."
+}
+
+setup() {
+  local side
+  side=$(normalize_side "${1:-right}")
+  install_desktop_entry
+  register_binding
+  register_context_bindings
+  ensure_inner_padding_layer_rule
+  clear_legacy_opacity_rule
+  hyprctl repl 'if _G.sidekick_top_band_rule ~= nil then _G.sidekick_top_band_rule:set_enabled(false); _G.sidekick_top_band_rule = nil end' >/dev/null 2>&1 || true
+  ensure_rule "$side"
+  ensure_lock_rule "$side"
+  mkdir -p "$(dirname "$MOVE_PROFILE_STATE_FILE")"
+  window_move_profile >"$MOVE_PROFILE_STATE_FILE"
+  dedupe_sidekick_clients
+
+  local existing
+  existing=$(client_json || true)
+  if [[ -n $existing ]]; then
+    local address
+    address=$(jq -r '.address' <<<"$existing")
+    restore_window_theme_border "address:$address"
+    if client_hidden "$existing"; then
+      preload_window "$address" "$side"
+    fi
+    return 0
+  fi
+
+  # Preload the selected experience once Quickshell has loaded preferences.
+  # Unsupported saved modes stay dormant rather than throwing a startup modal.
+  local config="$HOME/.config/omarchy/sidekick.json"
+  local display empty_terminal agent
+  display=$(normalize_display "$(jq -r '.display // \"tui\"' "$config" 2>/dev/null || printf 'tui\n')")
+  empty_terminal=$(jq -r '.emptyTerminal // false' "$config" 2>/dev/null || printf 'false\n')
+  agent=$(omarchy-default-agent 2>/dev/null || true)
+  [[ $empty_terminal == true || -n $agent ]] || return 0
+  if [[ $empty_terminal != true && $display == web ]] && ! web_url "$agent" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ $empty_terminal != true && $display == desktop ]] \
+      && { [[ $agent != codex && $agent != chatgpt ]] || ! command -v chatgpt >/dev/null 2>&1; }; then
+    return 0
+  fi
+  launch_agent "$side" "$display" "$agent" "$empty_terminal" false
+}
+
+toggle_current() {
+  # The hidden hotkey path trusts the persisted preload address/geometry and
+  # skips a full compositor client enumeration. That query was the largest
+  # remaining delay before the first motion frame.
+  local state_visible state_address side state_width state_monitor
+  if [[ -f $STRIP_STATE_FILE ]]; then
+    IFS=$'\t' read -r state_visible state_address side state_width state_monitor < <(
+      jq -r '[.visible, (.address // ""), (.side // "right"), (.paneWidth // 0), (.monitor // "")] | @tsv' "$STRIP_STATE_FILE"
+    )
+  fi
+  side=$(normalize_side "${side:-right}")
+  if [[ $state_visible == false && $state_address =~ ^0x[0-9a-fA-F]+$ && $state_width =~ ^[0-9]+$ ]]; then
+    local active_json known_json state_window_width=$state_width state_display
+    active_json=$(hyprctl activewindow -j 2>/dev/null || printf '{}')
+    state_display=$(jq -r '.display // "tui"' "$HOME/.config/omarchy/sidekick.json" 2>/dev/null || printf 'tui\n')
+    [[ $state_display != web && $state_display != desktop ]] || state_window_width=480
+    known_json="{\"size\":[$state_window_width,0],\"workspace\":{\"name\":\"$WORKSPACE\"}}"
+    place_window "$state_address" "$side" true "" "$known_json" "$active_json"
+    return 0
+  fi
+
+  local json active_json=''
+  json=$(client_json || true)
+  if [[ -n $json ]]; then
+    if client_hidden "$json"; then
+      active_json=$(hyprctl activewindow -j 2>/dev/null || printf '{}')
+      place_window "$(jq -r '.address' <<<"$json")" "$side" true "" "$json" "$active_json"
+    else
+      hide_window "$json" "$side"
+    fi
+    return 0
+  fi
+
+  local config="$HOME/.config/omarchy/sidekick.json"
+  local display empty_terminal agent
+  side=$(jq -r '.side // "right"' "$config" 2>/dev/null || printf 'right\n')
+  display=$(jq -r '.display // "tui"' "$config" 2>/dev/null || printf 'tui\n')
+  empty_terminal=$(jq -r '.emptyTerminal // false' "$config" 2>/dev/null || printf 'false\n')
+  agent=$(omarchy-default-agent 2>/dev/null || true)
+  launch_agent "$side" "$display" "$agent" "$empty_terminal"
+}
+
+toggle() {
+  local side
+  side=$(normalize_side "${1:-right}")
+  local display
+  display=$(normalize_display "${2:-tui}")
+  local agent=${3:-}
+  local empty_terminal=${4:-false}
+  local json
+  json=$(client_json || true)
+
+  if [[ -z $json ]]; then
+    launch_agent "$side" "$display" "$agent" "$empty_terminal"
+  elif client_hidden "$json"; then
+    place_window "$(jq -r '.address' <<<"$json")" "$side" true "$(stored_pane_width)"
+  else
+    hide_window "$json" "$side"
+  fi
+}
+
+collapse() {
+  local side
+  side=$(normalize_side "${1:-right}")
+  local json
+  json=$(client_json || true)
+  [[ -n $json ]] || return 0
+  client_hidden "$json" || hide_window "$json" "$side"
+}
+
+select_side() {
+  local old_side new_side
+  old_side=$(normalize_side "${1:-right}")
+  new_side=$(normalize_side "${2:-left}")
+  local display
+  display=$(normalize_display "${3:-tui}")
+  local agent=${4:-}
+  local empty_terminal=${5:-false}
+  local json
+  json=$(client_json || true)
+  ensure_rule "$new_side"
+
+  if [[ -z $json ]]; then
+    launch_agent "$new_side" "$display" "$agent" "$empty_terminal"
+    return
+  fi
+  if client_hidden "$json"; then
+    place_window "$(jq -r '.address' <<<"$json")" "$new_side" true "$(stored_pane_width)"
+    return
+  fi
+  [[ $old_side != "$new_side" ]] || return 0
+
+  # Two distinct edge animations: collapse into the old side, then reveal from
+  # the new side. The agent/browser process remains alive on the storage
+  # workspace between them.
+  hide_window "$json" "$old_side" true
+  json=$(client_json || true)
+  [[ -n $json ]] || return 0
+  place_window "$(jq -r '.address' <<<"$json")" "$new_side" true "$(stored_pane_width)"
+}
+
+handle_monitor_change() {
+  local side
+  side=$(normalize_side "${1:-right}")
+  dedupe_sidekick_clients
+  local json
+  json=$(client_json || true)
+  [[ -n $json ]] || return 0
+
+  local address width height y window
+  address=$(jq -r '.address' <<<"$json")
+  width=$(jq -r '.size[0]' <<<"$json")
+  height=$(jq -r '.size[1]' <<<"$json")
+  y=$(jq -r '.at[1]' <<<"$json")
+  window="address:$address"
+
+  # Hide the old-monitor surface atomically before querying any replacement
+  # geometry. Users never see resizing, pin correction, or duplicate cleanup.
+  set_strip_state false "$side" 0 "" "$address" "$width" "$y" "$height" false false
+  remember_manual_animation_setting
+  set_manual_move_animations false
+  set_window_no_animation "$window" 1
+  hyprctl repl "hl.dispatch(hl.dsp.window.pin({ window = \"$window\", action = \"disable\" })); hl.dispatch(hl.dsp.window.move({ window = \"$window\", workspace = \"$WORKSPACE\", follow = false }))" >/dev/null
+  set_window_no_animation "$window" unset
+  restore_manual_animation_setting
+  restore_focus
+
+  # Let Hyprland finish publishing the new monitor/workspace topology while the
+  # client is safely hidden, then size its preload against the focused display.
+  sleep 0.15
+  preload_window "$address" "$side"
+}
+
+sync_geometry() {
+  local side
+  side=$(normalize_side "${1:-right}")
+  local bar_state=${2:-auto}
+  local json
+  json=$(client_json || true)
+  [[ -n $json ]] || return 0
+  local hidden=false
+  client_hidden "$json" && hidden=true
+
+  local x y width height off_x _workspace_id strip_width monitor_name
+  IFS=$'\t' read -r x y width height off_x _workspace_id strip_width monitor_name < <(position_data "$side" "$bar_state")
+  local address window
+  address=$(jq -r '.address' <<<"$json")
+  window="address:$address"
+
+  if [[ $hidden == true ]]; then
+    local actual_width hidden_x hidden_lua
+    actual_width=$(jq -r '.size[0]' <<<"$json")
+    hidden_x=$off_x
+    if [[ $side == left ]] && (( actual_width > width )); then
+      hidden_x=$((off_x - actual_width + width))
+    fi
+    # Hidden clients stay fully rendered, so update their complete final Y and
+    # height immediately whenever bar bounds change. Reveal then needs only an
+    # X move and can never grow upward/downward after becoming visible.
+    remember_manual_animation_setting
+    set_manual_move_animations false
+    set_window_no_animation "$window" 1
+    hidden_lua="hl.dispatch(hl.dsp.window.pin({ window = \"$window\", action = \"disable\" })); hl.dispatch(hl.dsp.window.move({ window = \"$window\", workspace = \"$WORKSPACE\", follow = false })); hl.dispatch(hl.dsp.window.set_prop({ window = \"$window\", prop = \"min_size\", value = \"$width $height\" })); hl.dispatch(hl.dsp.window.set_prop({ window = \"$window\", prop = \"max_size\", value = \"$width $height\" })); hl.dispatch(hl.dsp.window.resize({ window = \"$window\", x = $width, y = $height })); hl.dispatch(hl.dsp.window.move({ window = \"$window\", x = $hidden_x, y = $y }))"
+    hyprctl repl "$hidden_lua" >/dev/null
+    set_strip_state false "$side" "$strip_width" "$monitor_name" "$address" "$width" "$y" "$height"
+    set_window_no_animation "$window" unset
+    restore_manual_animation_setting
+    return 0
+  fi
+
+  set_strip_state true "$side" "$strip_width" "$monitor_name" "$address" "$width" "$y" "$height"
+
+  # Bar-bound geometry snaps atomically with animation disabled so the real
+  # Hyprland top border can never sweep through the visible content area.
+  remember_manual_animation_setting
+  set_manual_move_animations false
+  set_window_no_animation "$window" 1
+  local geometry_lua
+  geometry_lua="hl.dispatch(hl.dsp.window.resize({ window = \"$window\", x = $width, y = $height })); hl.dispatch(hl.dsp.window.move({ window = \"$window\", x = $x, y = $y }))"
+  hyprctl repl "$geometry_lua" >/dev/null
+  set_window_no_animation "$window" unset
+  restore_manual_animation_setting
+}
+
+select_mode() {
+  local side
+  side=$(normalize_side "${1:-right}")
+  local display
+  display=$(normalize_display "${2:-tui}")
+  local agent=${3:-}
+  local empty_terminal=${4:-false}
+  local json
+  json=$(client_json || true)
+
+  if [[ -n $json ]] && ! client_hidden "$json"; then
+    hide_window "$json" "$side"
+    json=$(client_json || true)
+  fi
+  [[ -z $json ]] || close_window "$json"
+  for _ in $(seq 1 40); do
+    [[ -z $(client_json || true) ]] && break
+    sleep 0.05
+  done
+  # A confirmed display reset explicitly asks for the selected default
+  # experience, so discard the remembered manual terminal override here only.
+  rm -f "$ACTIVITY_STATE_FILE"
+  launch_agent "$side" "$display" "$agent" "$empty_terminal"
+}
+
+strip_hide() {
+  local terminal_pid=${1:-}
+  if [[ $terminal_pid =~ ^[0-9]+$ && -f $STRIP_STATE_FILE ]]; then
+    local state_address state_pid
+    state_address=$(jq -r '.address // empty' "$STRIP_STATE_FILE" 2>/dev/null || true)
+    state_pid=$(hyprctl clients -j 2>/dev/null | jq -r --arg address "$state_address" 'first(.[]|select(.address==$address))|.pid // empty')
+    # A replaced terminal may finish after its successor has opened. Never let
+    # the stale wrapper clear the new pane's visibility/geometry state.
+    [[ -z $state_pid || $state_pid == "$terminal_pid" ]] || return 0
+  fi
+  set_strip_state false right 0 ""
+  restore_focus
+  restore_manual_animation_setting
+}
+
+status() {
+  local json
+  json=$(client_json || true)
+  if [[ -z $json ]]; then
+    jq -nc '{running:false,visible:false}'
+  else
+    local visible=true
+    client_hidden "$json" && visible=false
+    jq -c --argjson visible "$visible" \
+      '{running:true,visible:$visible,class:.class,workspace:.workspace.name,address:.address}' <<<"$json"
+  fi
+}
+
+command=${1:-toggle}
+shift || true
+
+# Bar visibility signals and user shortcuts can arrive in the same animation
+# window. Serialize mutations so temporary Hyprland animation settings are
+# always restored in the order they were captured.
+case "$command" in
+  status | geometry | web-url) ;;
+  *)
+    lock_file="${XDG_RUNTIME_DIR:-/tmp}/omarchy-sidekick.lock"
+    exec 9>"$lock_file"
+    flock 9
+    ;;
+esac
+
+case "$command" in
+  setup) setup "$@" ;;
+  bind) register_binding ;;
+  toggle) toggle "$@" ;;
+  toggle-current) toggle_current ;;
+  collapse) collapse "$@" ;;
+  focus-away) focus_away_from_sidekick "${1:-}" ;;
+  focus-at-edge) focus_sidekick_at_edge "${1:-}" "${2:-}" ;;
+  activity-end) mark_activity_ended ;;
+  cursor-guard) set_cursor_guard "${1:-off}" ;;
+  sync-geometry) sync_geometry "$@" ;;
+  monitor-change) handle_monitor_change "$@" ;;
+  select-side | move-side) select_side "$@" ;;
+  place)
+    side=$(normalize_side "${1:-right}")
+    ensure_rule "$side"
+    json=$(client_json || true)
+    [[ -z $json ]] || client_hidden "$json" || place_window "$(jq -r '.address' <<<"$json")" "$side" false
+    ;;
+  select-mode | switch) select_mode "$@" ;;
+  close) close_window ;;
+  status) status ;;
+  geometry) position_data "${1:-right}" "${2:-auto}" ;;
+  strip-hide) strip_hide ;;
+  web-url) web_url "${1:-}" ;;
+  *)
+    echo "Usage: sidekick {setup|bind|toggle|toggle-current|collapse|focus-away|focus-at-edge|activity-end|cursor-guard|sync-geometry|monitor-change|select-side|select-mode|place|close|status|geometry|strip-hide|web-url}" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,59 @@
+#!/bin/bash
+set -u
+
+root_pid=${1:?wrapper pid required}
+state_file="$HOME/.local/state/omarchy/sidekick-activity.json"
+boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+last_payload=""
+
+is_agent() {
+  case "$1" in
+    pi | omp | opencode | claude | codex | grok | gemini | copilot | crush) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+descendants() {
+  local parent=$1 child
+  for child in $(pgrep -P "$parent" 2>/dev/null || true); do
+    [[ $child == $$ ]] && continue
+    printf '%s\n' "$child"
+    descendants "$child"
+  done
+}
+
+while kill -0 "$root_pid" 2>/dev/null; do
+  agent=""
+  activity_pid=""
+  shell_pid=""
+
+  while read -r pid; do
+    [[ $pid =~ ^[0-9]+$ ]] || continue
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+    comm=${comm%%:*}
+    comm=${comm##*/}
+    if is_agent "$comm"; then
+      agent=$comm
+      activity_pid=$pid
+      break
+    fi
+    case "$comm" in bash | zsh | fish | nu) [[ -n $shell_pid ]] || shell_pid=$pid ;; esac
+  done < <(descendants "$root_pid")
+
+  target_pid=${activity_pid:-$shell_pid}
+  cwd=""
+  [[ -z $target_pid ]] || cwd=$(readlink -f "/proc/$target_pid/cwd" 2>/dev/null || true)
+  [[ -n $cwd ]] || cwd=$HOME/Work
+
+  payload=$(jq -nc --arg agent "$agent" --arg cwd "$cwd" --arg boot "$boot_id" \
+    --argjson wrapper "$root_pid" \
+    '{agent:$agent,cwd:$cwd,bootId:$boot,wrapperPid:$wrapper,active:true}')
+  if [[ $payload != "$last_payload" ]]; then
+    mkdir -p "$(dirname "$state_file")"
+    tmp=$(mktemp "${state_file}.XXXXXX")
+    printf '%s\n' "$payload" >"$tmp"
+    mv "$tmp" "$state_file"
+    last_payload=$payload
+  fi
+  sleep 0.25
+done

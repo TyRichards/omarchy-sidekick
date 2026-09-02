@@ -1,0 +1,4 @@
+*.swp
+*.tmp
+.memory/
+.DS_Store

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.tyrichards.sidekick",
+  "name": "Sidekick",
+  "version": "0.1.0",
+  "author": "Ty Richards",
+  "license": "MIT",
+  "description": "A slide-out side panel for your default Omarchy agent.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Sidekick",
+    "description": "Slide-out default agent and settings",
+    "category": "AI",
+    "aliases": ["agent", "assistant", "side-panel"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

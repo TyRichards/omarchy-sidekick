@@ -1,0 +1,245 @@
+#!/bin/bash
+set -euo pipefail
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo"
+
+omarchy-plugin-validate .
+
+jq -e '
+  .schemaVersion == 1 and
+  .id == "io.github.tyrichards.sidekick" and
+  (.kinds | index("bar-widget")) and
+  .entryPoints.barWidget == "Panel.qml" and
+  .barWidget.defaultSection == "right"
+' manifest.json >/dev/null
+
+for agent in claude codex grok gemini copilot chatgpt; do
+  url=$(bin/sidekick web-url "$agent")
+  [[ $url == https://* ]] || { echo "No HTTPS URL for $agent" >&2; exit 1; }
+done
+for agent in pi omp opencode crush; do
+  if bin/sidekick web-url "$agent" >/dev/null 2>&1; then
+    echo "Unexpected hosted web app for $agent" >&2
+    exit 1
+  fi
+done
+
+bash -n bin/sidekick
+bash -n bin/sidekick-terminal
+bash -n bin/sidekick-activity-watch
+if command -v shellcheck >/dev/null; then
+  shellcheck bin/sidekick bin/sidekick-terminal bin/sidekick-activity-watch test/all
+fi
+
+rg -q 'Style\.space\(380\)' Panel.qml
+rg -q 'Set Default Agent' Panel.qml
+rg -q 'Reset Default Agent' Panel.qml
+rg -Fq 'DEFAULT AGENT ·' Panel.qml
+rg -Fq 'DIVING INTO THE DETAILS' Panel.qml
+rg -Fq 'PUNCHING THROUGH THE BUG' Panel.qml
+rg -Fq 'ODDJOBB-ING THE ODD JOB' Panel.qml
+rg -Fq 'HOLY SMOKES, BATMAN!' Panel.qml
+rg -Fq 'TASKING THE RANDOM TASK' Panel.qml
+rg -Fq 'jokeIndex = (jokeIndex + 1) % sidekickJokes.length' Panel.qml
+rg -Fq 'Your default agent does NOT have a web app.' Panel.qml
+rg -Fq 'rejectShake.restart()' Panel.qml
+rg -Fq 'shakeDirection: bar && bar.position === "left" ? 1 : -1' Panel.qml
+rg -Fq 'to: 5 * root.shakeDirection' Panel.qml
+rg -Fq 'to: 3 * root.shakeDirection' Panel.qml
+rg -Fq 'anchorItem: panelAnchor' Panel.qml
+if rg -Fq 'rejectionOffset' Panel.qml; then
+  echo "Shake must target the complete modal, not its content" >&2
+  exit 1
+fi
+rg -Fq 'function rejectWebApp()' Panel.qml
+rg -Fq 'tui_supported_agent' bin/sidekick
+rg -Fq 'cursor-guard' Panel.qml
+rg -Fq 'sidekick_modal_open' bin/sidekick
+if rg -Fq 'agent-changed' Panel.qml || rg -Fq 'agent_changed' bin/sidekick; then
+  echo "Default-agent changes must not replace live Sidekick activity" >&2
+  exit 1
+fi
+rg -Fq 'cursor:no_warps' bin/sidekick
+rg -Fq 'SUPER + \\' Panel.qml
+rg -Fq 'iconText: "󱚣"' Panel.qml
+rg -q 'SIDE PANEL' Panel.qml
+rg -q 'DISPLAY PREFERENCE' Panel.qml
+rg -Fq 'iconText: ""' Panel.qml
+rg -Fq 'iconText: ""' Panel.qml
+rg -Fq 'iconText: ""' Panel.qml
+rg -Fq 'iconText: ""' Panel.qml
+rg -q 'text: "Terminal"' Panel.qml
+rg -q 'text: "Web App"' Panel.qml
+rg -q 'text: "Desktop"' Panel.qml
+terminal_mode_line=$(rg -n 'text: "Terminal"' Panel.qml | tail -1 | cut -d: -f1)
+web_mode_line=$(rg -n 'text: "Web App"' Panel.qml | tail -1 | cut -d: -f1)
+desktop_mode_line=$(rg -n 'text: "Desktop"' Panel.qml | tail -1 | cut -d: -f1)
+(( terminal_mode_line < web_mode_line && web_mode_line < desktop_mode_line ))
+rg -Fq 'chatgpt --class="$APP_ID"' bin/sidekick
+rg -Fq 'if [[ $title == ChatGPT' bin/sidekick
+rg -Fq 'command -v chatgpt' Panel.qml
+rg -Fq 'root.panelSide === "left" ? "" : ""' Panel.qml
+rg -Fq 'select-side' Panel.qml
+rg -Fq 'select_side' bin/sidekick
+rg -Fq 'select-mode' Panel.qml
+rg -Fq 'select_mode' bin/sidekick
+rg -q 'togglePanel' Panel.qml
+rg -q 'collapsePanel' Panel.qml
+if rg -q 'sidekick-(edge|top)-strip|sidekick-pane-top-rule|showEdgeStrip|showTopEdgeStrip|showPaneTopRule|edgeStrip|topEdgeStrip|paneTopRule' Panel.qml; then
+  echo "Sidekick must not recreate a legacy top/edge strip" >&2
+  exit 1
+fi
+if rg -q 'sidekick-inactive-top-band|inactiveTopBand|showInactiveTopBand|inactivePaneBorder|themeHyprlandFile' Panel.qml; then
+  echo "Sidekick must not create a top color band" >&2
+  exit 1
+fi
+rg -Fq 'sidekick_top_band_rule:set_enabled(false)' bin/sidekick
+rg -Fq 'opacity = \"1 1\"' bin/sidekick
+rg -Fq 'SUPER + BACKSLASH' bin/sidekick
+rg -Fq 'toggle-current' bin/sidekick
+rg -Fq 'SUPER + W' bin/sidekick
+rg -Fq 'sidekick-terminal-clipboard-v1' bin/sidekick
+rg -Fq 'clipboard_or_passthrough' bin/sidekick
+rg -Fq 'hl.unbind("CTRL + C")' bin/sidekick
+rg -Fq 'hl.unbind("CTRL + V")' bin/sidekick
+rg -Fq 'SUPER + LEFT' bin/sidekick
+rg -Fq 'SUPER + RIGHT' bin/sidekick
+rg -Fq 'focus_or_leave_sidekick' bin/sidekick
+rg -Fq 'focus_away_from_sidekick' bin/sidekick
+rg -Fq 'focus_sidekick_at_edge' bin/sidekick
+rg -Fq 'focusSidekickAtEdge' Panel.qml
+rg -Fq 'SUPER + SHIFT + LEFT' bin/sidekick
+rg -Fq 'SUPER + SHIFT + RIGHT' bin/sidekick
+rg -Fq 'swap_or_reposition_sidekick' bin/sidekick
+rg -Fq 'setSideFromBinding' Panel.qml
+rg -Fq 'ESCAPE' bin/sidekick
+if rg -Fq 'hl.bind("CTRL + D"' bin/sidekick; then
+  echo "Ctrl+D must not be overridden by Sidekick" >&2
+  exit 1
+fi
+rg -Fq 'omarchy-agent --inline' bin/sidekick-terminal
+rg -Fq 'termios.tcflush' bin/sidekick-terminal
+rg -Fq '"$shell" -l' bin/sidekick-terminal
+rg -Fq 'strip-hide' bin/sidekick-terminal
+rg -Fq 'sidekick-activity-watch' bin/sidekick-terminal
+rg -Fq 'run_resumed_agent' bin/sidekick-terminal
+rg -Fq 'There is no native Omarchy TUI option for that agent' bin/sidekick-terminal
+rg -Fq 'emptyTerminal' Panel.qml
+rg -Fq 'coverVisible:$coverVisible' bin/sidekick
+rg -Fq 'paddingOpen:$paddingOpen' bin/sidekick
+rg -Fq 'paddingSlideOffset' Panel.qml
+rg -Fq 'duration: root.inheritedMotionDuration' Panel.qml
+rg -Fq 'easing.bezierCurve: root.inheritedMotionCurve' Panel.qml
+rg -Fq 'current_height" true true' bin/sidekick
+rg -Fq 'Start the attached padding translation immediately before pane motion' bin/sidekick
+rg -Fq 'paddingCoverVisible' Panel.qml
+rg -Fq 'USE EMPTY TERMINAL' Panel.qml
+rg -Fq 'id: resetHeaderAction' Panel.qml
+rg -Fq 'text: "RESET"' Panel.qml
+rg -Fq 'id: resetHeaderRow' Panel.qml
+rg -Fq 'font.pixelSize: Style.font.subtitle * 1.5' Panel.qml
+reset_text_line=$(rg -n 'text: "RESET"' Panel.qml | tail -1 | cut -d: -f1)
+reset_icon_line=$(rg -n 'text: ""' Panel.qml | tail -1 | cut -d: -f1)
+(( reset_text_line < reset_icon_line ))
+rg -Fq 'id: footerShortcutHint' Panel.qml
+rg -Fq 'function resetSidekick()' Panel.qml
+rg -Fq 'anchors.right: parent.right' Panel.qml
+rg -Fq 'id: emptyTerminalSwitch' Panel.qml
+rg -A4 -F 'id: emptyTerminalLabel' Panel.qml | rg -Fq 'color: root.dim'
+rg -Fq 'opacity: root.emptyTerminal ? 0.35 : 1.0' Panel.qml
+side_line=$(rg -n 'text: "SIDE PANEL"' Panel.qml | cut -d: -f1)
+agent_line=$(rg -n 'Reset Default Agent' Panel.qml | tail -1 | cut -d: -f1)
+display_line=$(rg -n 'text: "DISPLAY PREFERENCE"' Panel.qml | cut -d: -f1)
+empty_line=$(rg -n 'id: emptyTerminalSwitch' Panel.qml | cut -d: -f1)
+(( side_line < agent_line && agent_line < display_line && display_line < empty_line ))
+rg -Fq 'cd "$HOME/Work"' bin/sidekick-terminal
+rg -Fq 'windowsMove' bin/sidekick
+rg -Fq 'omarchy-bar' bin/sidekick
+rg -Fq '($my - 4) as $y' bin/sidekick
+rg -Fq '($my + $mh + 4) as $bottom' bin/sidekick
+rg -Fq '($bottom - $y) as $h' bin/sidekick
+rg -Fq 'top border can never sweep through' bin/sidekick
+if rg -Fq 'border_color =' bin/sidekick; then
+  echo "Sidekick must inherit Hyprland active/inactive border colors" >&2
+  exit 1
+fi
+rg -Fq 'active_border=$(theme_border_expression active)' bin/sidekick
+rg -Fq 'inactive_border=$(theme_border_expression inactive)' bin/sidekick
+rg -Fq 'prop = \"active_border_color\", value = $active_border' bin/sidekick
+rg -Fq 'prop = \"inactive_border_color\", value = $inactive_border' bin/sidekick
+if rg -Fq '1.0 override 1.0 override 1.0 override' bin/sidekick; then
+  echo "Sidekick must inherit global opacity" >&2
+  exit 1
+fi
+rg -Fq 'remember_focus' bin/sidekick
+rg -Fq 'restore_focus' bin/sidekick
+rg -Fq 'activeWindow.workspace.id' bin/sidekick
+rg -Fq 'stale focus address from a prior workspace' bin/sidekick
+rg -Fq 'hl.dsp.focus({ workspace' bin/sidekick
+rg -Fq 'begin_window_move' bin/sidekick
+rg -Fq 'finish_window_move' bin/sidekick
+rg -Fq 'speed / 10 + 0.02' bin/sidekick
+if rg -q 'sidekickReveal|sidekickClose|speed = 1\.6' bin/sidekick; then
+  echo "Sidekick must not override the inherited Hyprland motion profile" >&2
+  exit 1
+fi
+rg -Fq 'id: motionProfileProcess' Panel.qml
+rg -Fq 'root.inheritedMotionDuration' Panel.qml
+rg -Fq 'root.inheritedMotionCurve' Panel.qml
+rg -Fq 'effective.speed || 0) * 100' Panel.qml
+rg -Fq 'MOVE_PROFILE_STATE_FILE' bin/sidekick
+rg -Fq 'set_window_no_animation "$window" 1' bin/sidekick
+rg -Fq 'Web App minimum-size settlement fight the reveal' bin/sidekick
+rg -Fq 'window_width_override=480' bin/sidekick
+rg -Fq 'clientClass.indexOf("brave-") === 0' Panel.qml
+rg -Fq '(1400 / 3)' bin/sidekick
+if rg -Fq '| min | floor) + 100' bin/sidekick; then
+  echo "Sidekick must stay at the capped one-third width" >&2
+  exit 1
+fi
+if rg -Fq 'pane_width_override=800' bin/sidekick; then
+  echo "Sidekick must use the shared 466-unit target in every mode" >&2
+  exit 1
+fi
+[[ $(bin/sidekick web-url codex) == "https://chatgpt.com" ]]
+rg -Fq '($mw / 3)' bin/sidekick
+rg -Fq '$w as $windowWidth' bin/sidekick
+rg -Fq 'var paneWidth = basePaneWidth' Panel.qml
+rg -Fq 'sidekick-inner-padding' Panel.qml
+rg -Fq 'WlrLayershell.layer: WlrLayer.Overlay' Panel.qml
+rg -Fq 'sidekick-horizontal-padding' Panel.qml
+rg -Fq 'showInnerHorizontalPadding' Panel.qml
+rg -Fq 'bar.position === "top" && displayPreference === "web"' Panel.qml
+rg -Fq 'implicitHeight: Math.max(1, Math.round(Number(root.bar ? root.bar.barSize : 0)))' Panel.qml
+rg -Fq 'mask: Region {}' Panel.qml
+rg -Fq 'Color.background : "transparent"' Panel.qml
+rg -Fq 'sidekick-inner-padding-order-v2' bin/sidekick
+rg -Fq 'namespace = "^sidekick-inner-padding-(left|right)$" }, order = 100' bin/sidekick
+rg -Fq 'sidekick-horizontal-padding-order' bin/sidekick
+rg -Fq 'namespace = "^sidekick-horizontal-padding-(left|right)$" }, order = -100' bin/sidekick
+rg -Fq 'String(stripState.side || "") === bar.position' Panel.qml
+rg -Fq 'innerSideCoverWidth' Panel.qml
+rg -Fq 'paddingSlideOffset + paddingMotionDistance' Panel.qml
+rg -Fq 'implicitWidth: Math.max(1, root.innerSideCoverWidth)' Panel.qml
+rg -Fq '($mx - $windowWidth - 2)' bin/sidekick
+rg -Fq '($mx + $mw + 2)' bin/sidekick
+rg -Fq 'preload_window' bin/sidekick
+rg -Fq 'launch_agent "$side" "$display" "$agent" "$empty_terminal" false' bin/sidekick
+rg -Fq 'Hidden clients stay fully rendered' bin/sidekick
+rg -Fq 'if [[ $hidden == true ]]' bin/sidekick
+rg -Fq 'dedupe_sidekick_clients' bin/sidekick
+rg -Fq "A tag alone" bin/sidekick
+rg -Fq 'Remove that tag, but never close the window' bin/sidekick
+rg -Fq "Sidekick's silent storage workspace" bin/sidekick
+if rg -Fq 'prop = \"opacity\"' bin/sidekick; then
+  echo "Sidekick visibility must never depend on persistent opacity props" >&2
+  exit 1
+fi
+rg -Fq 'reveal_lua="hl.config({ misc = { animate_manual_resizes = true } })' bin/sidekick
+rg -Fq '"monitorremovedv2"' Panel.qml
+rg -Fq '"monitor-change"' Panel.qml
+rg -Fq 'handle_monitor_change' bin/sidekick
+rg -Fq 'Users never see resizing, pin correction, or duplicate cleanup' bin/sidekick
+
+echo "Sidekick checks passed"
